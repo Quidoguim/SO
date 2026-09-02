@@ -10,15 +10,14 @@
 //               e Interrupcoes possíveis, define o que executa para cada instrucao
 //           VM -  a máquina virtual é uma instanciação de CPU e Memória
 //    Depois as definições de SW:
-//           no momento são esqueletos (so estrutura) para
-//					InterruptHandling    e
-//					SysCallHandling 
+//					InterruptHandling, SysCallHandling  e
+//					GerenteMemoria (paginação: aloca/desaloca frames, tradução de endereço)
 //    A seguir temos utilitários para usar o sistema
-//           carga, início de execução e dump de memória
+//           carga paginada, início de execução e dump de memória (física e lógica)
 //    Por último os programas existentes, que podem ser copiados em memória.
 //           Isto representa programas armazenados.
-//    Veja o main.  Ele instancia o Sistema com os elementos mencionados acima.
-//           em seguida solicita a execução de algum programa com  loadAndExec
+//    Veja o main.  Ele instancia o Sistema (com tamMem/tamPg escolhidos) e chama run(),
+//           que aloca, carrega e executa os processos via GerenteMemoria
 
 import java.util.*;
 
@@ -90,21 +89,25 @@ public class Sistema {
 
 		private Word[] m;   // m é o array de memória "física", CPU tem uma ref a m para acessar
 
+		private int tamPg;          // tamanho de página/frame usado na tradução de endereços
+		private int[] tabelaPaginas; // tabela de páginas do processo atualmente no contexto da CPU
+
 		private InterruptHandling ih;    // significa desvio para rotinas de tratamento de Int - se int ligada, desvia
 		private SysCallHandling sysCall; // significa desvio para tratamento de chamadas de sistema
 
-		private boolean cpuStop;    // flag para parar CPU - caso de interrupcao que acaba o processo, ou chamada stop - 
+		private boolean cpuStop;    // flag para parar CPU - caso de interrupcao que acaba o processo, ou chamada stop -
 									// nesta versao acaba o sistema no fim do prog
 
 		                            // auxilio aa depuração
 		private boolean debug;      // se true entao mostra cada instrucao em execucao
 		private Utilities u;        // para debug (dump)
 
-		public CPU(Memory _mem, boolean _debug) { // ref a MEMORIA passada na criacao da CPU
+		public CPU(Memory _mem, boolean _debug, int _tamPg) { // ref a MEMORIA passada na criacao da CPU
 			maxInt = 32767;            // capacidade de representacao modelada
 			minInt = -32767;           // se exceder deve gerar interrupcao de overflow
 			m = _mem.pos;              // usa o atributo 'm' para acessar a memoria, só para ficar mais pratico
 			reg = new int[10];         // aloca o espaço dos registradores - regs 8 e 9 usados somente para IO
+			tamPg = _tamPg;
 
 			debug = _debug;            // se true, print da instrucao em execucao
 
@@ -120,15 +123,20 @@ public class Sistema {
 		}
 
 
-                                       // verificação de enderecamento 
-		private boolean legal(int e) { // todo acesso a memoria tem que ser verificado se é válido - 
-			                           // aqui no caso se o endereco é um endereco valido em toda memoria
-			if (e >= 0 && e < m.length) {
-				return true;
-			} else {
-				irpt = Interrupts.intEnderecoInvalido;    // se nao for liga interrupcao no meio da exec da instrucao
-				return false;
+                                       // tradução de endereço lógico -> físico, via tabela de páginas do processo
+		private int traduz(int enderecoLogico) { // todo acesso a memoria tem que ser traduzido e validado -
+			                                      // retorna o endereço físico, ou -1 se o endereço é inválido
+			if (enderecoLogico < 0) {
+				irpt = Interrupts.intEnderecoInvalido;   // se nao for liga interrupcao no meio da exec da instrucao
+				return -1;
 			}
+			int pagina = enderecoLogico / tamPg;
+			if (pagina >= tabelaPaginas.length) {        // página fora da tabela do processo -> acesso indevido
+				irpt = Interrupts.intEnderecoInvalido;
+				return -1;
+			}
+			int frame = tabelaPaginas[pagina];
+			return frame * tamPg + (enderecoLogico % tamPg);
 		}
 
 		private boolean testOverflow(int v) {             // toda operacao matematica deve avaliar se ocorre overflow
@@ -140,9 +148,9 @@ public class Sistema {
 			return true;
 		}
 
-		public void setContext(int _pc) {                 // usado para setar o contexto da cpu para rodar um processo
-			                                              // [ nesta versao é somente colocar o PC na posicao 0 ]
+		public void setContext(int _pc, int[] _tabelaPaginas) { // usado para setar o contexto da cpu para rodar um processo
 			pc = _pc;                                     // pc cfe endereco logico
+			tabelaPaginas = _tabelaPaginas;                // tabela de páginas do processo que assume a CPU
 			irpt = Interrupts.noInterrupt;                // reset da interrupcao registrada
 		}
 
@@ -153,8 +161,9 @@ public class Sistema {
 
 				// --------------------------------------------------------------------------------------------------
 				// FASE DE FETCH
-				if (legal(pc)) { // pc valido
-					ir = m[pc];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
+				int pcFisico = traduz(pc);
+				if (pcFisico != -1) { // pc valido
+					ir = m[pcFisico];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
 					             // resto é dump de debug
 					if (debug) {
 						System.out.print("                                              regs: ");
@@ -179,32 +188,36 @@ public class Sistema {
 							pc++;
 							break;
 						case LDD: // Rd <- [A]
-							if (legal(ir.p)) {
-								reg[ir.ra] = m[ir.p].p;
+							int endLDD = traduz(ir.p);
+							if (endLDD != -1) {
+								reg[ir.ra] = m[endLDD].p;
 								pc++;
 							}
 							break;
 						case LDX: // RD <- [RS] // NOVA
-							if (legal(reg[ir.rb])) {
-								reg[ir.ra] = m[reg[ir.rb]].p;
+							int endLDX = traduz(reg[ir.rb]);
+							if (endLDX != -1) {
+								reg[ir.ra] = m[endLDX].p;
 								pc++;
 							}
 							break;
 						case STD: // [A] ← Rs
-							if (legal(ir.p)) {
-								m[ir.p].opc = Opcode.DATA;
-								m[ir.p].p = reg[ir.ra];
+							int endSTD = traduz(ir.p);
+							if (endSTD != -1) {
+								m[endSTD].opc = Opcode.DATA;
+								m[endSTD].p = reg[ir.ra];
 								pc++;
-                                if (debug) 
-								    {   System.out.print("                                  ");   
-									    u.dump(ir.p,ir.p+1);							
+                                if (debug)
+								    {   System.out.print("                                  ");
+									    u.dump(endSTD,endSTD+1);
 									}
 								}
 							break;
 						case STX: // [Rd] ←Rs
-							if (legal(reg[ir.ra])) {
-								m[reg[ir.ra]].opc = Opcode.DATA;
-								m[reg[ir.ra]].p = reg[ir.rb];
+							int endSTX = traduz(reg[ir.ra]);
+							if (endSTX != -1) {
+								m[endSTX].opc = Opcode.DATA;
+								m[endSTX].p = reg[ir.rb];
 								pc++;
 							}
 							;
@@ -245,7 +258,10 @@ public class Sistema {
 							pc = ir.p;
 							break;
 						case JMPIM: // PC <- [A]
-							      pc = m[ir.p].p;
+							int endJMPIM = traduz(ir.p);
+							if (endJMPIM != -1) {
+								pc = m[endJMPIM].p;
+							}
 							break;
 						case JMPIG: // If Rc > 0 Then PC ← Rs Else PC ← PC +1
 							if (reg[ir.rb] > 0) {
@@ -290,24 +306,31 @@ public class Sistema {
 							}
 							break;
 						case JMPIGM: // If RC > 0 then PC <- [A] else PC++
-						    if (legal(ir.p)){
-							    if (reg[ir.rb] > 0) {
-								   pc = m[ir.p].p;
-							    } else {
-								  pc++;
-							   }
-						    }
+							if (reg[ir.rb] > 0) {
+								int endJMPIGM = traduz(ir.p);
+								if (endJMPIGM != -1) {
+									pc = m[endJMPIGM].p;
+								}
+							} else {
+								pc++;
+							}
 							break;
 						case JMPILM: // If RC < 0 then PC <- k else PC++
 							if (reg[ir.rb] < 0) {
-								pc = m[ir.p].p;
+								int endJMPILM = traduz(ir.p);
+								if (endJMPILM != -1) {
+									pc = m[endJMPILM].p;
+								}
 							} else {
 								pc++;
 							}
 							break;
 						case JMPIEM: // If RC = 0 then PC <- k else PC++
 							if (reg[ir.rb] == 0) {
-								pc = m[ir.p].p;
+								int endJMPIEM = traduz(ir.p);
+								if (endJMPIEM != -1) {
+									pc = m[endJMPIEM].p;
+								}
 							} else {
 								pc++;
 							}
@@ -360,10 +383,12 @@ public class Sistema {
 	public class HW {
 		public Memory mem;
 		public CPU cpu;
+		public int tamPg; // tamanho de página/frame usado pelo gerente de memória e pela CPU
 
-		public HW(int tamMem) {
+		public HW(int tamMem, int tamPg) {
 			mem = new Memory(tamMem);
-			cpu = new CPU(mem, true); // true liga debug
+			this.tamPg = tamPg;
+			cpu = new CPU(mem, true, tamPg); // true liga debug
 		}
 	}
 	// -------------------------------------------------------------------------------------------------------
@@ -419,8 +444,12 @@ public class Sistema {
 
 			} else if (hw.cpu.reg[8]==2){
 				  // escrita - escreve o conteuodo da memoria na posicao dada em reg[9]
-				  System.out.println("OUT:   "+ hw.mem.pos[hw.cpu.reg[9]].p);
-			} else {System.out.println("  PARAMETRO INVALIDO"); }		
+				  // reg[9] é um endereço lógico do processo, precisa ser traduzido antes de acessar a memória física
+				  int endFisico = hw.cpu.traduz(hw.cpu.reg[9]);
+				  if (endFisico != -1) {
+					  System.out.println("OUT:   "+ hw.mem.pos[endFisico].p);
+				  }
+			} else {System.out.println("  PARAMETRO INVALIDO"); }
 		}
 	}
 
@@ -436,13 +465,18 @@ public class Sistema {
 			hw = _hw;
 		}
 
-		private void loadProgram(Word[] p) {
+		// carga paginada: cada posição lógica i do programa é copiada, sem alterações,
+		// para o frame indicado por tabelaPaginas[i / tamPg], no deslocamento i % tamPg
+		public void carregaPaginado(Word[] imagem, int[] tabelaPaginas) {
 			Word[] m = hw.mem.pos; // m[] é o array de posições memória do hw
-			for (int i = 0; i < p.length; i++) {
-				m[i].opc = p[i].opc;
-				m[i].ra = p[i].ra;
-				m[i].rb = p[i].rb;
-				m[i].p = p[i].p;
+			int tamPg = hw.tamPg;
+			for (int i = 0; i < imagem.length; i++) {
+				int frame = tabelaPaginas[i / tamPg];
+				int fisico = frame * tamPg + (i % tamPg);
+				m[fisico].opc = imagem[i].opc;
+				m[fisico].ra = imagem[i].ra;
+				m[fisico].rb = imagem[i].rb;
+				m[fisico].p = imagem[i].p;
 			}
 		}
 
@@ -468,15 +502,64 @@ public class Sistema {
 			}
 		}
 
-		private void loadAndExec(Word[] p) {
-			loadProgram(p); // carga do programa na memoria
-			System.out.println("---------------------------------- programa carregado na memoria");
-			dump(0, p.length); // dump da memoria nestas posicoes
-			hw.cpu.setContext(0); // seta pc para endereço 0 - ponto de entrada dos programas
-			System.out.println("---------------------------------- inicia execucao ");
-			hw.cpu.run(); // cpu roda programa ate parar
-			System.out.println("---------------------------------- memoria após execucao ");
-			dump(0, p.length); // dump da memoria com resultado
+		// dump lógico: percorre o espaço de endereçamento do processo (0..tamanho-1)
+		// traduzindo cada posição pela tabela de páginas, para conferir que o processo
+		// "enxerga" sua memória contígua mesmo espalhada fisicamente em frames
+		public void dumpLogico(int[] tabelaPaginas, int tamanho) {
+			Word[] m = hw.mem.pos;
+			int tamPg = hw.tamPg;
+			for (int i = 0; i < tamanho; i++) {
+				int frame = tabelaPaginas[i / tamPg];
+				int fisico = frame * tamPg + (i % tamPg);
+				System.out.print(i + " (fisico " + fisico + "):  ");
+				dump(m[fisico]);
+			}
+		}
+	}
+
+	// ------------------ G E R E N T E D E M E M O R I A - paginação
+	// -----------------------------------------
+	public class GerenteMemoria {
+		private int tamPg;
+		private int numFrames;
+		private boolean[] frameOcupado; // controle de quadros livres/ocupados
+
+		public GerenteMemoria(int tamMem, int tamPg) {
+			this.tamPg = tamPg;
+			numFrames = tamMem / tamPg;
+			frameOcupado = new boolean[numFrames];
+		}
+
+		// aloca os frames necessários para nroPalavras. Retorna a tabelaPaginas
+		// (tabelaPaginas[pagina] = frame), ou null se não há memória livre suficiente
+		public int[] aloca(int nroPalavras) {
+			int nroPaginas = (int) Math.ceil(nroPalavras / (double) tamPg);
+
+			int livres = 0;
+			for (int f = 0; f < numFrames; f++) {
+				if (!frameOcupado[f]) livres++;
+			}
+			if (livres < nroPaginas) {
+				return null; // não há memória suficiente
+			}
+
+			int[] tabelaPaginas = new int[nroPaginas];
+			int pagina = 0;
+			for (int f = 0; f < numFrames && pagina < nroPaginas; f++) {
+				if (!frameOcupado[f]) {
+					frameOcupado[f] = true;
+					tabelaPaginas[pagina] = f;
+					pagina++;
+				}
+			}
+			return tabelaPaginas;
+		}
+
+		// libera os frames usados por um processo
+		public void desaloca(int[] tabelaPaginas) {
+			for (int frame : tabelaPaginas) {
+				frameOcupado[frame] = false;
+			}
 		}
 	}
 
@@ -484,12 +567,14 @@ public class Sistema {
 		public InterruptHandling ih;
 		public SysCallHandling sc;
 		public Utilities utils;
+		public GerenteMemoria gm;
 
 		public SO(HW hw) {
 			ih = new InterruptHandling(hw); // rotinas de tratamento de int
 			sc = new SysCallHandling(hw); // chamadas de sistema
 			hw.cpu.setAddressOfHandlers(ih, sc);
 			utils = new Utilities(hw);
+			gm = new GerenteMemoria(hw.mem.pos.length, hw.tamPg);
 		}
 	}
 	// -------------------------------------------------------------------------------------------------------
@@ -500,25 +585,46 @@ public class Sistema {
 	public SO so;
 	public Programs progs;
 
-	public Sistema(int tamMem) {
-		hw = new HW(tamMem);           // memoria do HW tem tamMem palavras
+	public Sistema(int tamMem, int tamPg) {
+		hw = new HW(tamMem, tamPg);    // memoria do HW tem tamMem palavras, paginada em blocos de tamPg
 		so = new SO(hw);
 		hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
 		progs = new Programs();
 	}
 
+	// demonstra o Gerente de Memória (Fase 1A): aloca e carrega dois processos
+	// paginados simultaneamente, executa cada um via tradução de endereço, e
+	// depois desaloca/realoca para mostrar o reaproveitamento de frames livres
 	public void run() {
+		System.out.println("==================== tamMem=" + hw.mem.pos.length + "  tamPg=" + hw.tamPg + " ====================");
 
-		so.utils.loadAndExec(progs.retrieveProgram("fatorialV2"));
+		Word[] progA = progs.retrieveProgram("fatorialV2");
+		Word[] progB = progs.retrieveProgram("fibonacci10v2");
 
-		// so.utils.loadAndExec(progs.retrieveProgram("fatorial"));
-		// fibonacci10,
-		// fibonacci10v2,
-		// progMinimo,
-		// fatorialWRITE, // saida
-		// fibonacciREAD, // entrada
-		// PB
-		// PC, // bubble sort
+		int[] tabA = so.gm.aloca(progA.length);
+		if (tabA == null) { System.out.println("Falha ao alocar memoria para fatorialV2"); return; }
+		so.utils.carregaPaginado(progA, tabA);
+		System.out.println("fatorialV2 carregado. tabelaPaginas: " + Arrays.toString(tabA));
+
+		int[] tabB = so.gm.aloca(progB.length);
+		if (tabB == null) { System.out.println("Falha ao alocar memoria para fibonacci10v2"); return; }
+		so.utils.carregaPaginado(progB, tabB);
+		System.out.println("fibonacci10v2 carregado. tabelaPaginas: " + Arrays.toString(tabB));
+
+		System.out.println("---------------------------------- executando fatorialV2");
+		hw.cpu.setContext(0, tabA);
+		hw.cpu.run();
+		so.utils.dumpLogico(tabA, progA.length);
+
+		System.out.println("---------------------------------- executando fibonacci10v2");
+		hw.cpu.setContext(0, tabB);
+		hw.cpu.run();
+		so.utils.dumpLogico(tabB, progB.length);
+
+		System.out.println("---------------------------------- desaloca fatorialV2 e realoca um processo do mesmo tamanho");
+		so.gm.desaloca(tabA);
+		int[] tabC = so.gm.aloca(progA.length);
+		System.out.println("tabelaPaginas reaproveitada: " + Arrays.toString(tabC));
 	}
 	// ------------------- S I S T E M A - fim
 	// --------------------------------------------------------------
@@ -527,8 +633,8 @@ public class Sistema {
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- instancia e testa sistema
 	public static void main(String args[]) {
-		Sistema s = new Sistema(1024);
-		s.run();
+		new Sistema(1024, 8).run();
+		new Sistema(256, 16).run();
 	}
 
 	// -------------------------------------------------------------------------------------------------------
