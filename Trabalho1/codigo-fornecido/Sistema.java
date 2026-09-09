@@ -72,7 +72,7 @@ public class Sistema {
 	}
 
 	public enum Interrupts {           // possiveis interrupcoes que esta CPU gera
-		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow;
+		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer;
 	}
 
 	public class CPU {
@@ -92,6 +92,9 @@ public class Sistema {
 		private int tamPg;          // tamanho de página/frame usado na tradução de endereços
 		private int[] tabelaPaginas; // tabela de páginas do processo atualmente no contexto da CPU
 
+		private int delta;          // tamanho da fatia de tempo, em número de instruções (round-robin)
+		private int contadorDelta;  // quantas instruções já executou o processo atual nesta fatia
+
 		private InterruptHandling ih;    // significa desvio para rotinas de tratamento de Int - se int ligada, desvia
 		private SysCallHandling sysCall; // significa desvio para tratamento de chamadas de sistema
 
@@ -99,15 +102,18 @@ public class Sistema {
 									// nesta versao acaba o sistema no fim do prog
 
 		                            // auxilio aa depuração
-		private boolean debug;      // se true entao mostra cada instrucao em execucao
+		private volatile boolean debug; // se true entao mostra cada instrucao em execucao - volatile: lido pela
+										// thread de escalonamento, alterado pela thread do shell (traceOn/traceOff)
 		private Utilities u;        // para debug (dump)
 
-		public CPU(Memory _mem, boolean _debug, int _tamPg) { // ref a MEMORIA passada na criacao da CPU
+		public CPU(Memory _mem, boolean _debug, int _tamPg, int _delta) { // ref a MEMORIA passada na criacao da CPU
 			maxInt = 32767;            // capacidade de representacao modelada
 			minInt = -32767;           // se exceder deve gerar interrupcao de overflow
 			m = _mem.pos;              // usa o atributo 'm' para acessar a memoria, só para ficar mais pratico
-			reg = new int[10];         // aloca o espaço dos registradores - regs 8 e 9 usados somente para IO
 			tamPg = _tamPg;
+			delta = _delta;
+			// reg NÃO é alocado aqui: a cada setContext(pcb), reg passa a ser a mesma referência de pcb.reg
+			// (o registrador do processo É o contexto guardado no PCB enquanto ele estiver rodando)
 
 			debug = _debug;            // se true, print da instrucao em execucao
 
@@ -152,10 +158,18 @@ public class Sistema {
 			return true;
 		}
 
-		public void setContext(int _pc, int[] _tabelaPaginas) { // usado para setar o contexto da cpu para rodar um processo
-			pc = _pc;                                     // pc cfe endereco logico
-			tabelaPaginas = _tabelaPaginas;                // tabela de páginas do processo que assume a CPU
-			irpt = Interrupts.noInterrupt;                // reset da interrupcao registrada
+		public void setContext(PCB pcb) { // usado para setar o contexto da cpu para rodar (ou retomar) um processo
+			pc = pcb.pc;                                   // pc cfe endereco logico, de onde o processo parou
+			reg = pcb.reg;                                 // aliasing: reg passa a ser o array de contexto do PCB
+			tabelaPaginas = pcb.tabelaPaginas;              // tabela de páginas do processo que assume a CPU
+			contadorDelta = 0;                              // nova fatia de tempo começa do zero
+			irpt = Interrupts.noInterrupt;                  // reset da interrupcao registrada
+		}
+
+		// salva o contexto do processo que está perdendo a CPU (usado ao preemptar por timer).
+		// só o pc precisa ser copiado: reg já é a mesma referência de pcb.reg (aliasing em setContext)
+		public void salvaContexto(PCB pcb) {
+			pcb.pc = pc;
 		}
 
 		public void run() {                               // execucao da CPU supoe que o contexto da CPU, vide acima, 
@@ -370,6 +384,14 @@ public class Sistema {
 					}
 				}
 				// --------------------------------------------------------------------------------------------------
+				// FATIA DE TEMPO: conta uma instrução completa, sem erro nem STOP, para o round-robin
+				if (!cpuStop && irpt == Interrupts.noInterrupt) {
+					contadorDelta++;
+					if (contadorDelta >= delta) {
+						irpt = Interrupts.intTimer;
+					}
+				}
+				// --------------------------------------------------------------------------------------------------
 				// VERIFICA INTERRUPÇÃO !!! - TERCEIRA FASE DO CICLO DE INSTRUÇÕES
 				if (irpt != Interrupts.noInterrupt) { // existe interrupção
 					ih.handle(irpt);                  // desvia para rotina de tratamento - esta rotina é do SO
@@ -389,10 +411,10 @@ public class Sistema {
 		public CPU cpu;
 		public int tamPg; // tamanho de página/frame usado pelo gerente de memória e pela CPU
 
-		public HW(int tamMem, int tamPg) {
+		public HW(int tamMem, int tamPg, int delta) {
 			mem = new Memory(tamMem);
 			this.tamPg = tamPg;
-			cpu = new CPU(mem, false, tamPg); // debug desligado por padrão - liga/desliga via traceOn/traceOff
+			cpu = new CPU(mem, false, tamPg, delta); // debug desligado por padrão - liga/desliga via traceOn/traceOff
 		}
 	}
 	// -------------------------------------------------------------------------------------------------------
@@ -412,15 +434,31 @@ public class Sistema {
 	// ----------------------------------
 	public class InterruptHandling {
 		private HW hw; // referencia ao hw se tiver que setar algo
+		private GerenteProcessos gp;
+		private Escalonador escalonador;
 
-		public InterruptHandling(HW _hw) {
+		public InterruptHandling(HW _hw, GerenteProcessos _gp, Escalonador _escalonador) {
 			hw = _hw;
+			gp = _gp;
+			escalonador = _escalonador;
 		}
 
 		public void handle(Interrupts irpt) {
-			// apenas avisa - todas interrupcoes neste momento finalizam o programa
-			System.out.println(
-					"                                               Interrupcao " + irpt + "   pc: " + hw.cpu.pc);
+			if (irpt == Interrupts.intTimer) {
+				// fim de fatia de tempo: processo continua vivo, só perde a CPU e volta para prontos
+				PCB interrompido = gp.getRunning();
+				hw.cpu.salvaContexto(interrompido);
+				System.out.println("                                               TIMER: processo " + interrompido.id
+						+ " perde a CPU, volta para fila de prontos");
+				gp.preemptaProcessoEmExecucao();
+			} else {
+				// acesso indevido, instrucao invalida ou overflow: processo é finalizado de vez
+				PCB finalizado = gp.getRunning();
+				System.out.println("                                               Interrupcao " + irpt
+						+ "   processo " + (finalizado != null ? finalizado.id : "?") + " finalizado");
+				gp.finalizaProcessoEmExecucao();
+			}
+			escalonador.escalona(); // libera a CPU para o próximo processo pronto, se houver
 		}
 	}
 
@@ -428,14 +466,20 @@ public class Sistema {
 	// ----------------------
 	public class SysCallHandling {
 		private HW hw; // referencia ao hw se tiver que setar algo
+		private GerenteProcessos gp;
+		private Escalonador escalonador;
 
-		public SysCallHandling(HW _hw) {
+		public SysCallHandling(HW _hw, GerenteProcessos _gp, Escalonador _escalonador) {
 			hw = _hw;
+			gp = _gp;
+			escalonador = _escalonador;
 		}
 
 		public void stop() { // chamada de sistema indicando final de programa
-							 // nesta versao cpu simplesmente pára
+							 // desaloca o processo (memoria + pcb) e libera a CPU para o próximo pronto
 			System.out.println("                                               SYSCALL STOP");
+			gp.finalizaProcessoEmExecucao();
+			escalonador.escalona();
 		}
 
 		public void handle() { // chamada de sistema 
@@ -575,7 +619,9 @@ public class Sistema {
 		public int id;
 		public int[] tabelaPaginas;
 		public int tamanho;          // nro de palavras do programa (tamanho lógico do processo)
-		public int pc;               // pc do processo (0 = início; contexto completo só na Fase 1C)
+		public int pc;               // pc do processo (0 = início; salvo/restaurado a cada troca de contexto)
+		public int[] reg;            // contexto dos registradores do processo (10 posições, como a CPU) -
+									 // enquanto o processo roda, é o MESMO array referenciado por CPU.reg
 		public EstadoProcesso estado;
 
 		public PCB(int id, int[] tabelaPaginas, int tamanho) {
@@ -583,10 +629,15 @@ public class Sistema {
 			this.tabelaPaginas = tabelaPaginas;
 			this.tamanho = tamanho;
 			this.pc = 0;
+			this.reg = new int[10];
 			this.estado = EstadoProcesso.PRONTO;
 		}
 	}
 
+	// A partir da Fase 1C, tanto a thread do shell (new/rm/ps/dump) quanto a
+	// thread de escalonamento mexem nestas estruturas - por isso todo método é
+	// synchronized (lock no próprio GerenteProcessos), e coleções retornadas são
+	// cópias defensivas (evita ConcurrentModificationException em ps/execAll).
 	public class GerenteProcessos {
 		private GerenteMemoria gm;
 		private Utilities utils;
@@ -602,7 +653,7 @@ public class Sistema {
 
 		// cria um processo a partir da imagem já resolvida do programa.
 		// retorna o id do processo, ou -1 se não há memória suficiente
-		public int criaProcesso(Word[] imagem) {
+		public synchronized int criaProcesso(Word[] imagem) {
 			int[] tabelaPaginas = gm.aloca(imagem.length);
 			if (tabelaPaginas == null) {
 				return -1; // sem memória suficiente
@@ -614,40 +665,87 @@ public class Sistema {
 			return pcb.id;
 		}
 
-		// desaloca memória, remove das filas e destroi o PCB do processo com o id dado
-		public boolean desalocaProcesso(int id) {
+		// tenta remover o processo com o id dado. Checagem de estado e remoção são
+		// atômicas (um único método synchronized) para não competir com a thread
+		// de escalonamento promovendo esse mesmo processo a RODANDO nesse meio-tempo
+		public synchronized String tentaRemover(int id) {
 			PCB pcb = todosProcessos.get(id);
 			if (pcb == null) {
-				return false;
+				return "processo nao encontrado: " + id;
+			}
+			if (pcb.estado == EstadoProcesso.RODANDO) {
+				return "processo " + id + " esta em execucao, tente novamente";
 			}
 			gm.desaloca(pcb.tabelaPaginas);
 			prontos.remove(pcb);
-			if (running == pcb) {
-				running = null;
-			}
 			todosProcessos.remove(id);
-			return true;
+			return "processo removido: " + id;
 		}
 
-		public PCB buscaProcesso(int id) {
+		public synchronized PCB buscaProcesso(int id) {
 			return todosProcessos.get(id);
 		}
 
-		public Collection<PCB> getTodosProcessos() {
-			return todosProcessos.values();
+		public synchronized List<PCB> getTodosProcessos() {
+			return new ArrayList<>(todosProcessos.values()); // cópia defensiva
+		}
+
+		// tira o próximo processo pronto da fila (ou null se não houver nenhum)
+		public synchronized PCB proximoPronto() {
+			return prontos.poll();
 		}
 
 		// tira o processo da fila de prontos e o marca como rodando
-		public void iniciaExecucao(PCB pcb) {
+		public synchronized void iniciaExecucao(PCB pcb) {
 			prontos.remove(pcb);
 			running = pcb;
 			pcb.estado = EstadoProcesso.RODANDO;
 		}
 
-		// marca o processo em execução como terminado
-		public void finalizaExecucao() {
-			running.estado = EstadoProcesso.TERMINADO;
+		// processo perdeu a CPU por fim de fatia de tempo, mas continua vivo: volta pro fim da fila
+		public synchronized void preemptaProcessoEmExecucao() {
+			running.estado = EstadoProcesso.PRONTO;
+			prontos.add(running);
 			running = null;
+		}
+
+		// processo em execução terminou (STOP) ou foi finalizado por erro: sai do sistema de vez
+		public synchronized void finalizaProcessoEmExecucao() {
+			if (running == null) {
+				return;
+			}
+			gm.desaloca(running.tabelaPaginas);
+			todosProcessos.remove(running.id);
+			running = null;
+		}
+
+		public synchronized PCB getRunning() {
+			return running;
+		}
+	}
+
+	// ------------------ E S C A L O N A D O R - round-robin
+	// -----------------------------------------
+	public class Escalonador {
+		private HW hw;
+		private GerenteProcessos gp;
+
+		public Escalonador(HW hw, GerenteProcessos gp) {
+			this.hw = hw;
+			this.gp = gp;
+		}
+
+		// escolhe o próximo processo pronto (se houver) e prepara a CPU para executá-lo.
+		// só é chamado a partir de uma única thread por vez (a de escalonamento, direta
+		// ou indiretamente via ih.handle/sysCall.stop rodando dentro de hw.cpu.run()),
+		// então a segurança vem inteiramente dos métodos synchronized do GP que ele chama
+		public void escalona() {
+			PCB proximo = gp.proximoPronto();
+			if (proximo == null) {
+				return; // fila de prontos vazia - CPU fica ociosa
+			}
+			gp.iniciaExecucao(proximo);
+			hw.cpu.setContext(proximo);
 		}
 	}
 
@@ -657,14 +755,56 @@ public class Sistema {
 		public Utilities utils;
 		public GerenteMemoria gm;
 		public GerenteProcessos gp;
+		public Escalonador escalonador;
 
 		public SO(HW hw) {
-			ih = new InterruptHandling(hw); // rotinas de tratamento de int
-			sc = new SysCallHandling(hw); // chamadas de sistema
-			hw.cpu.setAddressOfHandlers(ih, sc);
 			utils = new Utilities(hw);
 			gm = new GerenteMemoria(hw.mem.pos.length, hw.tamPg);
 			gp = new GerenteProcessos(gm, utils);
+			escalonador = new Escalonador(hw, gp); // gm/gp/escalonador antes de ih/sc, que agora dependem deles
+			ih = new InterruptHandling(hw, gp, escalonador); // rotinas de tratamento de int
+			sc = new SysCallHandling(hw, gp, escalonador); // chamadas de sistema
+			hw.cpu.setAddressOfHandlers(ih, sc);
+		}
+	}
+
+	// ------------------ T H R E A D D E E S C A L O N A M E N T O - fundo
+	// -----------------------------------------
+	// Roda continuamente desde o início do sistema: sempre que a CPU está livre,
+	// tenta escalonar o próximo processo pronto e executa uma fatia. É a thread
+	// que, junto com a do Shell, satisfaz o requisito de escalonamento contínuo
+	// e independente de comandos (Fase 1C, seção 3.2).
+	public class ThreadEscalonador extends Thread {
+		private HW hw;
+		private SO so;
+		private volatile boolean rodando = true;
+
+		public ThreadEscalonador(HW hw, SO so) {
+			this.hw = hw;
+			this.so = so;
+			setDaemon(true); // não impede a JVM de encerrar quando o shell sair
+		}
+
+		public void run() {
+			while (rodando) {
+				if (so.gp.getRunning() == null) {
+					so.escalonador.escalona(); // tenta achar um processo pronto (bootstrap ou CPU ociosa)
+				}
+				if (so.gp.getRunning() != null) {
+					hw.cpu.run(); // roda uma fatia (ou até terminar/erro); ao voltar, o handler já preparou o próximo
+				} else {
+					try {
+						Thread.sleep(20);
+					} catch (InterruptedException e) {
+						// interrompida por encerra() - volta a checar o flag rodando
+					}
+				}
+			}
+		}
+
+		public void encerra() {
+			rodando = false;
+			interrupt();
 		}
 	}
 
@@ -674,16 +814,19 @@ public class Sistema {
 		private HW hw;
 		private SO so;
 		private Programs progs;
+		private ThreadEscalonador threadEscalonador;
 
 		public Shell(HW hw, SO so, Programs progs) {
 			this.hw = hw;
 			this.so = so;
 			this.progs = progs;
+			this.threadEscalonador = new ThreadEscalonador(hw, so);
+			this.threadEscalonador.start();
 		}
 
 		public void loop() {
 			Scanner scanner = new Scanner(System.in);
-			System.out.println("Sistema pronto. Comandos: new <programa>, rm <id>, ps, dump <id>, dumpM <ini> <fim>, exec <id>, traceOn, traceOff, exit");
+			System.out.println("Sistema pronto (escalonamento continuo em background). Comandos: new <programa>, rm <id>, ps, dump <id>, dumpM <ini> <fim>, exec <id>, execAll, traceOn, traceOff, exit");
 			boolean rodando = true;
 			while (rodando) {
 				System.out.print("> ");
@@ -716,6 +859,9 @@ public class Sistema {
 					case "exec":
 						cmdExec(partes);
 						break;
+					case "execAll":
+						cmdExecAll();
+						break;
 					case "traceOn":
 						hw.cpu.setDebug(true);
 						System.out.println("trace ligado");
@@ -731,6 +877,7 @@ public class Sistema {
 						System.out.println("comando desconhecido: " + cmd);
 				}
 			}
+			threadEscalonador.encerra();
 			scanner.close();
 			System.out.println("Encerrando o sistema.");
 		}
@@ -758,11 +905,7 @@ public class Sistema {
 			if (id == null) {
 				return;
 			}
-			if (so.gp.desalocaProcesso(id)) {
-				System.out.println("processo " + id + " removido");
-			} else {
-				System.out.println("processo nao encontrado: " + id);
-			}
+			System.out.println(so.gp.tentaRemover(id));
 		}
 
 		private void cmdPs() {
@@ -783,7 +926,8 @@ public class Sistema {
 				return;
 			}
 			System.out.println("PCB id=" + pcb.id + "  estado=" + pcb.estado + "  tamanho=" + pcb.tamanho
-					+ "  pc=" + pcb.pc + "  paginas=" + Arrays.toString(pcb.tabelaPaginas));
+					+ "  pc=" + pcb.pc + "  reg=" + Arrays.toString(pcb.reg)
+					+ "  paginas=" + Arrays.toString(pcb.tabelaPaginas));
 			so.utils.dumpLogico(pcb.tabelaPaginas, pcb.tamanho);
 		}
 
@@ -801,6 +945,9 @@ public class Sistema {
 			}
 		}
 
+		// a partir da Fase 1C a execução é automática e contínua (thread de escalonamento
+		// em background) - exec não dispara mais a CPU diretamente (evitaria condição de
+		// corrida com essa thread); fica como consulta rápida do estado do processo
 		private void cmdExec(String[] partes) {
 			Integer id = parseId(partes, 1, "uso: exec <id>");
 			if (id == null) {
@@ -811,14 +958,22 @@ public class Sistema {
 				System.out.println("processo nao encontrado: " + id);
 				return;
 			}
-			if (pcb.estado == EstadoProcesso.TERMINADO) {
-				System.out.println("processo " + id + " ja foi finalizado");
-				return;
+			System.out.println("processo " + id + " estado=" + pcb.estado
+					+ " (execucao e automatica em background - 'exec' nao dispara nada, so informa)");
+		}
+
+		// bloqueia até não sobrar nenhum processo no sistema - a execução em si acontece
+		// na thread de escalonamento, execAll so espera o resultado ficar pronto
+		private void cmdExecAll() {
+			System.out.println("aguardando todos os processos atuais terminarem...");
+			while (!so.gp.getTodosProcessos().isEmpty()) {
+				try {
+					Thread.sleep(20);
+				} catch (InterruptedException e) {
+					return;
+				}
 			}
-			so.gp.iniciaExecucao(pcb);
-			hw.cpu.setContext(pcb.pc, pcb.tabelaPaginas);
-			hw.cpu.run();
-			so.gp.finalizaExecucao();
+			System.out.println("execAll concluido - nenhum processo restante");
 		}
 
 		private Integer parseId(String[] partes, int indice, String usoMsg) {
@@ -843,8 +998,9 @@ public class Sistema {
 	public SO so;
 	public Programs progs;
 
-	public Sistema(int tamMem, int tamPg) {
-		hw = new HW(tamMem, tamPg);    // memoria do HW tem tamMem palavras, paginada em blocos de tamPg
+	public Sistema(int tamMem, int tamPg, int delta) {
+		hw = new HW(tamMem, tamPg, delta); // memoria do HW tem tamMem palavras, paginada em blocos de tamPg,
+											// fatia de tempo de delta instrucoes por processo (round-robin)
 		so = new SO(hw);
 		hw.cpu.setUtilities(so.utils); // permite cpu fazer dump de memoria ao avancar
 		progs = new Programs();
@@ -860,7 +1016,7 @@ public class Sistema {
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- instancia e testa sistema
 	public static void main(String args[]) {
-		new Sistema(1024, 8).run();
+		new Sistema(1024, 8, 5).run();
 	}
 
 	// -------------------------------------------------------------------------------------------------------

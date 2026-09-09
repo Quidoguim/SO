@@ -25,7 +25,7 @@ O trabalho é dividido em fases progressivas, construídas sobre o hardware simu
 | HW | Hardware simulado (fornecido pelo professor) | ✅ Fornecido |
 | 1A | Gerente de Memória — paginação (alocação/desalocação de frames, tradução de endereço lógico→físico) | ✅ Implementado |
 | 1B | Gerente de Processos — PCB, fila de prontos, shell interativo (`new`, `rm`, `ps`, `dump`, `exec`, `traceOn/Off`, `exit`) | ✅ Implementado |
-| 1C | Escalonamento — round-robin por fatia de tempo, salvamento/restauração de contexto, `execAll`, execução contínua multithreaded | ⬜ Não iniciado |
+| 1C | Escalonamento — round-robin por fatia de tempo, salvamento/restauração de contexto, `execAll`, execução contínua multithreaded | ✅ Implementado |
 
 ## Licença
 
