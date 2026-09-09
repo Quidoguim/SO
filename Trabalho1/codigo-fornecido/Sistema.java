@@ -122,6 +122,10 @@ public class Sistema {
 			u = _u;                     // aponta para rotinas utilitárias - fazer dump da memória na tela
 		}
 
+		public void setDebug(boolean _debug) { // liga/desliga trace de instrucoes (comandos traceOn/traceOff)
+			debug = _debug;
+		}
+
 
                                        // tradução de endereço lógico -> físico, via tabela de páginas do processo
 		private int traduz(int enderecoLogico) { // todo acesso a memoria tem que ser traduzido e validado -
@@ -388,7 +392,7 @@ public class Sistema {
 		public HW(int tamMem, int tamPg) {
 			mem = new Memory(tamMem);
 			this.tamPg = tamPg;
-			cpu = new CPU(mem, true, tamPg); // true liga debug
+			cpu = new CPU(mem, false, tamPg); // debug desligado por padrão - liga/desliga via traceOn/traceOff
 		}
 	}
 	// -------------------------------------------------------------------------------------------------------
@@ -563,11 +567,96 @@ public class Sistema {
 		}
 	}
 
+	// ------------------ G E R E N T E D E P R O C E S S O S
+	// -----------------------------------------
+	public enum EstadoProcesso { PRONTO, RODANDO, TERMINADO }
+
+	public class PCB {
+		public int id;
+		public int[] tabelaPaginas;
+		public int tamanho;          // nro de palavras do programa (tamanho lógico do processo)
+		public int pc;               // pc do processo (0 = início; contexto completo só na Fase 1C)
+		public EstadoProcesso estado;
+
+		public PCB(int id, int[] tabelaPaginas, int tamanho) {
+			this.id = id;
+			this.tabelaPaginas = tabelaPaginas;
+			this.tamanho = tamanho;
+			this.pc = 0;
+			this.estado = EstadoProcesso.PRONTO;
+		}
+	}
+
+	public class GerenteProcessos {
+		private GerenteMemoria gm;
+		private Utilities utils;
+		private LinkedHashMap<Integer, PCB> todosProcessos = new LinkedHashMap<>();
+		private LinkedList<PCB> prontos = new LinkedList<>();
+		private PCB running;
+		private int proximoId = 1;
+
+		public GerenteProcessos(GerenteMemoria gm, Utilities utils) {
+			this.gm = gm;
+			this.utils = utils;
+		}
+
+		// cria um processo a partir da imagem já resolvida do programa.
+		// retorna o id do processo, ou -1 se não há memória suficiente
+		public int criaProcesso(Word[] imagem) {
+			int[] tabelaPaginas = gm.aloca(imagem.length);
+			if (tabelaPaginas == null) {
+				return -1; // sem memória suficiente
+			}
+			utils.carregaPaginado(imagem, tabelaPaginas);
+			PCB pcb = new PCB(proximoId++, tabelaPaginas, imagem.length);
+			todosProcessos.put(pcb.id, pcb);
+			prontos.add(pcb);
+			return pcb.id;
+		}
+
+		// desaloca memória, remove das filas e destroi o PCB do processo com o id dado
+		public boolean desalocaProcesso(int id) {
+			PCB pcb = todosProcessos.get(id);
+			if (pcb == null) {
+				return false;
+			}
+			gm.desaloca(pcb.tabelaPaginas);
+			prontos.remove(pcb);
+			if (running == pcb) {
+				running = null;
+			}
+			todosProcessos.remove(id);
+			return true;
+		}
+
+		public PCB buscaProcesso(int id) {
+			return todosProcessos.get(id);
+		}
+
+		public Collection<PCB> getTodosProcessos() {
+			return todosProcessos.values();
+		}
+
+		// tira o processo da fila de prontos e o marca como rodando
+		public void iniciaExecucao(PCB pcb) {
+			prontos.remove(pcb);
+			running = pcb;
+			pcb.estado = EstadoProcesso.RODANDO;
+		}
+
+		// marca o processo em execução como terminado
+		public void finalizaExecucao() {
+			running.estado = EstadoProcesso.TERMINADO;
+			running = null;
+		}
+	}
+
 	public class SO {
 		public InterruptHandling ih;
 		public SysCallHandling sc;
 		public Utilities utils;
 		public GerenteMemoria gm;
+		public GerenteProcessos gp;
 
 		public SO(HW hw) {
 			ih = new InterruptHandling(hw); // rotinas de tratamento de int
@@ -575,8 +664,177 @@ public class Sistema {
 			hw.cpu.setAddressOfHandlers(ih, sc);
 			utils = new Utilities(hw);
 			gm = new GerenteMemoria(hw.mem.pos.length, hw.tamPg);
+			gp = new GerenteProcessos(gm, utils);
 		}
 	}
+
+	// ------------------ S H E L L - interface de comandos do usuário
+	// -----------------------------------------
+	public class Shell {
+		private HW hw;
+		private SO so;
+		private Programs progs;
+
+		public Shell(HW hw, SO so, Programs progs) {
+			this.hw = hw;
+			this.so = so;
+			this.progs = progs;
+		}
+
+		public void loop() {
+			Scanner scanner = new Scanner(System.in);
+			System.out.println("Sistema pronto. Comandos: new <programa>, rm <id>, ps, dump <id>, dumpM <ini> <fim>, exec <id>, traceOn, traceOff, exit");
+			boolean rodando = true;
+			while (rodando) {
+				System.out.print("> ");
+				if (!scanner.hasNextLine()) {
+					break; // entrada acabou (ex.: stdin redirecionado)
+				}
+				String linha = scanner.nextLine().trim();
+				if (linha.isEmpty()) {
+					continue;
+				}
+				String[] partes = linha.split("\\s+");
+				String cmd = partes[0];
+
+				switch (cmd) {
+					case "new":
+						cmdNew(partes);
+						break;
+					case "rm":
+						cmdRm(partes);
+						break;
+					case "ps":
+						cmdPs();
+						break;
+					case "dump":
+						cmdDump(partes);
+						break;
+					case "dumpM":
+						cmdDumpM(partes);
+						break;
+					case "exec":
+						cmdExec(partes);
+						break;
+					case "traceOn":
+						hw.cpu.setDebug(true);
+						System.out.println("trace ligado");
+						break;
+					case "traceOff":
+						hw.cpu.setDebug(false);
+						System.out.println("trace desligado");
+						break;
+					case "exit":
+						rodando = false;
+						break;
+					default:
+						System.out.println("comando desconhecido: " + cmd);
+				}
+			}
+			scanner.close();
+			System.out.println("Encerrando o sistema.");
+		}
+
+		private void cmdNew(String[] partes) {
+			if (partes.length < 2) {
+				System.out.println("uso: new <nomePrograma>");
+				return;
+			}
+			Word[] imagem = progs.retrieveProgram(partes[1]);
+			if (imagem == null) {
+				System.out.println("programa desconhecido: " + partes[1]);
+				return;
+			}
+			int id = so.gp.criaProcesso(imagem);
+			if (id == -1) {
+				System.out.println("falha ao criar processo: memoria insuficiente");
+			} else {
+				System.out.println("processo criado. id=" + id);
+			}
+		}
+
+		private void cmdRm(String[] partes) {
+			Integer id = parseId(partes, 1, "uso: rm <id>");
+			if (id == null) {
+				return;
+			}
+			if (so.gp.desalocaProcesso(id)) {
+				System.out.println("processo " + id + " removido");
+			} else {
+				System.out.println("processo nao encontrado: " + id);
+			}
+		}
+
+		private void cmdPs() {
+			for (PCB pcb : so.gp.getTodosProcessos()) {
+				System.out.println("id=" + pcb.id + "  estado=" + pcb.estado + "  tamanho=" + pcb.tamanho
+						+ "  paginas=" + Arrays.toString(pcb.tabelaPaginas));
+			}
+		}
+
+		private void cmdDump(String[] partes) {
+			Integer id = parseId(partes, 1, "uso: dump <id>");
+			if (id == null) {
+				return;
+			}
+			PCB pcb = so.gp.buscaProcesso(id);
+			if (pcb == null) {
+				System.out.println("processo nao encontrado: " + id);
+				return;
+			}
+			System.out.println("PCB id=" + pcb.id + "  estado=" + pcb.estado + "  tamanho=" + pcb.tamanho
+					+ "  pc=" + pcb.pc + "  paginas=" + Arrays.toString(pcb.tabelaPaginas));
+			so.utils.dumpLogico(pcb.tabelaPaginas, pcb.tamanho);
+		}
+
+		private void cmdDumpM(String[] partes) {
+			if (partes.length < 3) {
+				System.out.println("uso: dumpM <inicio> <fim>");
+				return;
+			}
+			try {
+				int ini = Integer.parseInt(partes[1]);
+				int fim = Integer.parseInt(partes[2]);
+				so.utils.dump(ini, fim);
+			} catch (NumberFormatException e) {
+				System.out.println("uso: dumpM <inicio> <fim> (inteiros)");
+			}
+		}
+
+		private void cmdExec(String[] partes) {
+			Integer id = parseId(partes, 1, "uso: exec <id>");
+			if (id == null) {
+				return;
+			}
+			PCB pcb = so.gp.buscaProcesso(id);
+			if (pcb == null) {
+				System.out.println("processo nao encontrado: " + id);
+				return;
+			}
+			if (pcb.estado == EstadoProcesso.TERMINADO) {
+				System.out.println("processo " + id + " ja foi finalizado");
+				return;
+			}
+			so.gp.iniciaExecucao(pcb);
+			hw.cpu.setContext(pcb.pc, pcb.tabelaPaginas);
+			hw.cpu.run();
+			so.gp.finalizaExecucao();
+		}
+
+		private Integer parseId(String[] partes, int indice, String usoMsg) {
+			if (partes.length <= indice) {
+				System.out.println(usoMsg);
+				return null;
+			}
+			try {
+				return Integer.parseInt(partes[indice]);
+			} catch (NumberFormatException e) {
+				System.out.println(usoMsg);
+				return null;
+			}
+		}
+	}
+
 	// -------------------------------------------------------------------------------------------------------
 	// ------------------- S I S T E M A
 	// --------------------------------------------------------------------
@@ -592,39 +850,8 @@ public class Sistema {
 		progs = new Programs();
 	}
 
-	// demonstra o Gerente de Memória (Fase 1A): aloca e carrega dois processos
-	// paginados simultaneamente, executa cada um via tradução de endereço, e
-	// depois desaloca/realoca para mostrar o reaproveitamento de frames livres
 	public void run() {
-		System.out.println("==================== tamMem=" + hw.mem.pos.length + "  tamPg=" + hw.tamPg + " ====================");
-
-		Word[] progA = progs.retrieveProgram("fatorialV2");
-		Word[] progB = progs.retrieveProgram("fibonacci10v2");
-
-		int[] tabA = so.gm.aloca(progA.length);
-		if (tabA == null) { System.out.println("Falha ao alocar memoria para fatorialV2"); return; }
-		so.utils.carregaPaginado(progA, tabA);
-		System.out.println("fatorialV2 carregado. tabelaPaginas: " + Arrays.toString(tabA));
-
-		int[] tabB = so.gm.aloca(progB.length);
-		if (tabB == null) { System.out.println("Falha ao alocar memoria para fibonacci10v2"); return; }
-		so.utils.carregaPaginado(progB, tabB);
-		System.out.println("fibonacci10v2 carregado. tabelaPaginas: " + Arrays.toString(tabB));
-
-		System.out.println("---------------------------------- executando fatorialV2");
-		hw.cpu.setContext(0, tabA);
-		hw.cpu.run();
-		so.utils.dumpLogico(tabA, progA.length);
-
-		System.out.println("---------------------------------- executando fibonacci10v2");
-		hw.cpu.setContext(0, tabB);
-		hw.cpu.run();
-		so.utils.dumpLogico(tabB, progB.length);
-
-		System.out.println("---------------------------------- desaloca fatorialV2 e realoca um processo do mesmo tamanho");
-		so.gm.desaloca(tabA);
-		int[] tabC = so.gm.aloca(progA.length);
-		System.out.println("tabelaPaginas reaproveitada: " + Arrays.toString(tabC));
+		new Shell(hw, so, progs).loop();
 	}
 	// ------------------- S I S T E M A - fim
 	// --------------------------------------------------------------
@@ -634,7 +861,6 @@ public class Sistema {
 	// ------------------- instancia e testa sistema
 	public static void main(String args[]) {
 		new Sistema(1024, 8).run();
-		new Sistema(256, 16).run();
 	}
 
 	// -------------------------------------------------------------------------------------------------------
@@ -658,7 +884,7 @@ public class Sistema {
 
 		public Word[] retrieveProgram(String pname) {
 			for (Program p : progs) {
-				if (p != null & p.name == pname)
+				if (p != null && p.name.equals(pname))
 					return p.image;
 			}
 			return null;
