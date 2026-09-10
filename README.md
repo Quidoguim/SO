@@ -27,7 +27,7 @@ O trabalho é dividido em fases progressivas, construídas sobre o hardware simu
 | 1B | Gerente de Processos — PCB, fila de prontos, shell interativo (`new`, `rm`, `ps`, `dump`, `exec`, `traceOn/Off`, `exit`) | ✅ Implementado |
 | 1C | Escalonamento — round-robin por fatia de tempo, salvamento/restauração de contexto, `execAll`, execução contínua multithreaded | ✅ Implementado |
 
-Com as três fases implementadas, o código passou por uma revisão de código (`/code-review xhigh`) focada em concorrência: foi encontrada e corrigida uma corrida real no escalonador que podia corromper memória entre processos, além de um crash em `dumpM` com índices fora do intervalo, uma trava silenciosa da thread de escalonamento, vazamento de dados entre processos ao reaproveitar frames, e saída de console que podia se intercalar entre threads. Detalhes de arquitetura e o que ainda ficou pendente (limpezas de baixo risco, não críticas) estão documentados no [CLAUDE.md](CLAUDE.md).
+Com as três fases implementadas, o código passou por uma revisão de código (`/code-review xhigh`) focada em concorrência: foi encontrada e corrigida uma corrida real no escalonador que podia corromper memória entre processos, além de um crash em `dumpM` com índices fora do intervalo, uma trava silenciosa da thread de escalonamento, vazamento de dados entre processos ao reaproveitar frames, e saída de console que podia se intercalar entre threads. Os demais achados da revisão (duplicação de código, ineficiências pontuais, e o comando `exec` recuperando um efeito real e seguro) também já foram aplicados. Detalhes de arquitetura estão documentados no [CLAUDE.md](CLAUDE.md).
 
 ## Licença
 

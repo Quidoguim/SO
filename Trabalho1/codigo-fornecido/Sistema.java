@@ -75,6 +75,16 @@ public class Sistema {
 		noInterrupt, intEnderecoInvalido, intInstrucaoInvalida, intOverflow, intTimer;
 	}
 
+	// aritmética de paginação compartilhada: dado o endereço lógico, a tabela de páginas
+	// do processo e o tamanho de página, calcula o endereço físico correspondente. Usado
+	// por CPU.traduz (que ainda valida limites antes de chamar) e por Utilities.carregaPaginado/
+	// dumpLogico (que já sabem que o endereço está dentro dos limites do processo)
+	private static int enderecoFisico(int[] tabelaPaginas, int tamPg, int enderecoLogico) {
+		int pagina = enderecoLogico / tamPg;
+		int frame = tabelaPaginas[pagina];
+		return frame * tamPg + (enderecoLogico % tamPg);
+	}
+
 	public class CPU {
 		private int maxInt; // valores maximo e minimo para inteiros nesta cpu
 		private int minInt;
@@ -145,8 +155,16 @@ public class Sistema {
 				irpt = Interrupts.intEnderecoInvalido;
 				return -1;
 			}
-			int frame = tabelaPaginas[pagina];
-			return frame * tamPg + (enderecoLogico % tamPg);
+			return enderecoFisico(tabelaPaginas, tamPg, enderecoLogico);
+		}
+
+		// PC <- [A]: usado por JMPIM (incondicional) e por JMPIGM/JMPILM/JMPIEM quando
+		// a condição correspondente é satisfeita - evita repetir traduz+checagem+atribuição
+		private void saltaIndireto(int enderecoLogico) {
+			int endereco = traduz(enderecoLogico);
+			if (endereco != -1) {
+				pc = m[endereco].p;
+			}
 		}
 
 		private boolean testOverflow(int v) {             // toda operacao matematica deve avaliar se ocorre overflow
@@ -280,10 +298,7 @@ public class Sistema {
 							pc = ir.p;
 							break;
 						case JMPIM: // PC <- [A]
-							int endJMPIM = traduz(ir.p);
-							if (endJMPIM != -1) {
-								pc = m[endJMPIM].p;
-							}
+							saltaIndireto(ir.p);
 							break;
 						case JMPIG: // If Rc > 0 Then PC ← Rs Else PC ← PC +1
 							if (reg[ir.rb] > 0) {
@@ -329,30 +344,21 @@ public class Sistema {
 							break;
 						case JMPIGM: // If RC > 0 then PC <- [A] else PC++
 							if (reg[ir.rb] > 0) {
-								int endJMPIGM = traduz(ir.p);
-								if (endJMPIGM != -1) {
-									pc = m[endJMPIGM].p;
-								}
+								saltaIndireto(ir.p);
 							} else {
 								pc++;
 							}
 							break;
 						case JMPILM: // If RC < 0 then PC <- k else PC++
 							if (reg[ir.rb] < 0) {
-								int endJMPILM = traduz(ir.p);
-								if (endJMPILM != -1) {
-									pc = m[endJMPILM].p;
-								}
+								saltaIndireto(ir.p);
 							} else {
 								pc++;
 							}
 							break;
 						case JMPIEM: // If RC = 0 then PC <- k else PC++
 							if (reg[ir.rb] == 0) {
-								int endJMPIEM = traduz(ir.p);
-								if (endJMPIEM != -1) {
-									pc = m[endJMPIEM].p;
-								}
+								saltaIndireto(ir.p);
 							} else {
 								pc++;
 							}
@@ -523,8 +529,7 @@ public class Sistema {
 			Word[] m = hw.mem.pos; // m[] é o array de posições memória do hw
 			int tamPg = hw.tamPg;
 			for (int i = 0; i < imagem.length; i++) {
-				int frame = tabelaPaginas[i / tamPg];
-				int fisico = frame * tamPg + (i % tamPg);
+				int fisico = enderecoFisico(tabelaPaginas, tamPg, i);
 				m[fisico].opc = imagem[i].opc;
 				m[fisico].ra = imagem[i].ra;
 				m[fisico].rb = imagem[i].rb;
@@ -567,8 +572,7 @@ public class Sistema {
 			int tamPg = hw.tamPg;
 			synchronized (System.out) { // o dump inteiro imprime como um bloco só
 			for (int i = 0; i < tamanho; i++) {
-				int frame = tabelaPaginas[i / tamPg];
-				int fisico = frame * tamPg + (i % tamPg);
+				int fisico = enderecoFisico(tabelaPaginas, tamPg, i);
 				System.out.print(i + " (fisico " + fisico + "):  ");
 				dump(m[fisico]);
 			}
@@ -579,28 +583,24 @@ public class Sistema {
 	// ------------------ G E R E N T E D E M E M O R I A - paginação
 	// -----------------------------------------
 	public class GerenteMemoria {
-		private int tamPg;
+		private HW hw; // referência ao hw - tamPg e a memória física são lidos daqui, sem duplicar campos
 		private int numFrames;
 		private boolean[] frameOcupado; // controle de quadros livres/ocupados
-		private Word[] m; // memória física, usado só para limpar frames ao desalocar
+		private int framesLivres; // contador mantido incrementalmente - evita varrer o array só para contar
 
-		public GerenteMemoria(Memory mem, int tamPg) {
-			this.tamPg = tamPg;
-			this.m = mem.pos;
-			numFrames = mem.pos.length / tamPg;
+		public GerenteMemoria(HW hw) {
+			this.hw = hw;
+			numFrames = hw.mem.pos.length / hw.tamPg;
 			frameOcupado = new boolean[numFrames];
+			framesLivres = numFrames;
 		}
 
 		// aloca os frames necessários para nroPalavras. Retorna a tabelaPaginas
 		// (tabelaPaginas[pagina] = frame), ou null se não há memória livre suficiente
 		public int[] aloca(int nroPalavras) {
+			int tamPg = hw.tamPg;
 			int nroPaginas = (int) Math.ceil(nroPalavras / (double) tamPg);
-
-			int livres = 0;
-			for (int f = 0; f < numFrames; f++) {
-				if (!frameOcupado[f]) livres++;
-			}
-			if (livres < nroPaginas) {
+			if (framesLivres < nroPaginas) {
 				return null; // não há memória suficiente
 			}
 
@@ -613,6 +613,7 @@ public class Sistema {
 					pagina++;
 				}
 			}
+			framesLivres -= nroPaginas;
 			return tabelaPaginas;
 		}
 
@@ -625,9 +626,12 @@ public class Sistema {
 				frameOcupado[frame] = false;
 				limpaFrame(frame);
 			}
+			framesLivres += tabelaPaginas.length;
 		}
 
 		private void limpaFrame(int frame) {
+			int tamPg = hw.tamPg;
+			Word[] m = hw.mem.pos;
 			int inicio = frame * tamPg;
 			for (int i = inicio; i < inicio + tamPg; i++) {
 				m[i].opc = Opcode.___;
@@ -640,7 +644,10 @@ public class Sistema {
 
 	// ------------------ G E R E N T E D E P R O C E S S O S
 	// -----------------------------------------
-	public enum EstadoProcesso { PRONTO, RODANDO, TERMINADO }
+	// TERMINADO não existe mais: desde a Fase 1C, STOP/erro desaloca o processo na
+	// hora (GerenteProcessos.finalizaProcessoEmExecucao) em vez de deixá-lo visível
+	// num estado terminado - ele simplesmente some de todosProcessos
+	public enum EstadoProcesso { PRONTO, RODANDO }
 
 	public class PCB {
 		public int id;
@@ -709,12 +716,34 @@ public class Sistema {
 			return "processo removido: " + id;
 		}
 
+		// move o processo para o início da fila de prontos, para ser o próximo escolhido
+		// pelo escalonador. Usado pelo comando exec: só PRIORIZA (não dispara a CPU
+		// diretamente - isso continua sendo responsabilidade exclusiva da thread de
+		// escalonamento), então não reabre a condição de corrida corrigida em escalonaProximo
+		public synchronized String priorizar(int id) {
+			PCB pcb = todosProcessos.get(id);
+			if (pcb == null) {
+				return "processo nao encontrado: " + id;
+			}
+			if (pcb.estado != EstadoProcesso.PRONTO) {
+				return "processo " + id + " esta " + pcb.estado + " - so processos prontos podem ser priorizados";
+			}
+			prontos.remove(pcb);
+			prontos.addFirst(pcb);
+			return "processo " + id + " priorizado - sera o proximo escolhido pelo escalonador";
+		}
+
 		public synchronized PCB buscaProcesso(int id) {
 			return todosProcessos.get(id);
 		}
 
 		public synchronized List<PCB> getTodosProcessos() {
 			return new ArrayList<>(todosProcessos.values()); // cópia defensiva
+		}
+
+		// verifica sem copiar a coleção inteira - usado pelo poll de execAll
+		public synchronized boolean existemProcessos() {
+			return !todosProcessos.isEmpty();
 		}
 
 		// tira o próximo processo pronto da fila e já o marca como rodando, atomicamente.
@@ -788,7 +817,7 @@ public class Sistema {
 
 		public SO(HW hw) {
 			utils = new Utilities(hw);
-			gm = new GerenteMemoria(hw.mem, hw.tamPg);
+			gm = new GerenteMemoria(hw);
 			gp = new GerenteProcessos(gm, utils);
 			escalonador = new Escalonador(hw, gp); // gm/gp/escalonador antes de ih/sc, que agora dependem deles
 			ih = new InterruptHandling(hw, gp, escalonador); // rotinas de tratamento de int
@@ -970,46 +999,39 @@ public class Sistema {
 		}
 
 		private void cmdDumpM(String[] partes) {
-			if (partes.length < 3) {
-				System.out.println("uso: dumpM <inicio> <fim>");
+			Integer ini = parseId(partes, 1, "uso: dumpM <inicio> <fim>");
+			if (ini == null) {
 				return;
 			}
-			try {
-				int ini = Integer.parseInt(partes[1]);
-				int fim = Integer.parseInt(partes[2]);
-				int tamMem = hw.mem.pos.length;
-				if (ini < 0 || fim > tamMem || ini > fim) {
-					System.out.println("intervalo invalido: memoria tem " + tamMem + " posicoes (0.." + (tamMem - 1) + ")");
-					return;
-				}
-				so.utils.dump(ini, fim);
-			} catch (NumberFormatException e) {
-				System.out.println("uso: dumpM <inicio> <fim> (inteiros)");
+			Integer fim = parseId(partes, 2, "uso: dumpM <inicio> <fim>");
+			if (fim == null) {
+				return;
 			}
+			int tamMem = hw.mem.pos.length;
+			if (ini < 0 || fim > tamMem || ini > fim) {
+				System.out.println("intervalo invalido: memoria tem " + tamMem + " posicoes (0.." + (tamMem - 1) + ")");
+				return;
+			}
+			so.utils.dump(ini, fim);
 		}
 
-		// a partir da Fase 1C a execução é automática e contínua (thread de escalonamento
-		// em background) - exec não dispara mais a CPU diretamente (evitaria condição de
-		// corrida com essa thread); fica como consulta rápida do estado do processo
+		// a partir da Fase 1C a execução é automática e contínua (thread de escalonamento em
+		// background) - exec não dispara mais a CPU diretamente (evitaria condição de corrida
+		// com essa thread); em vez disso, prioriza o processo (se ainda estiver PRONTO) para
+		// ser o próximo escolhido pelo escalonador, sem nunca tocar a CPU pelo lado do shell
 		private void cmdExec(String[] partes) {
 			Integer id = parseId(partes, 1, "uso: exec <id>");
 			if (id == null) {
 				return;
 			}
-			PCB pcb = so.gp.buscaProcesso(id);
-			if (pcb == null) {
-				System.out.println("processo nao encontrado: " + id);
-				return;
-			}
-			System.out.println("processo " + id + " estado=" + pcb.estado
-					+ " (execucao e automatica em background - 'exec' nao dispara nada, so informa)");
+			System.out.println(so.gp.priorizar(id));
 		}
 
 		// bloqueia até não sobrar nenhum processo no sistema - a execução em si acontece
 		// na thread de escalonamento, execAll so espera o resultado ficar pronto
 		private void cmdExecAll() {
 			System.out.println("aguardando todos os processos atuais terminarem...");
-			while (!so.gp.getTodosProcessos().isEmpty()) {
+			while (so.gp.existemProcessos()) {
 				try {
 					Thread.sleep(20);
 				} catch (InterruptedException e) {
