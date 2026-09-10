@@ -184,16 +184,18 @@ public class Sistema {
 					ir = m[pcFisico];  // <<<<<<<<<<<< AQUI faz FETCH - busca posicao da memoria apontada por pc, guarda em ir
 					             // resto é dump de debug
 					if (debug) {
-						System.out.print("                                              regs: ");
-						for (int i = 0; i < 10; i++) {
-							System.out.print(" r[" + i + "]:" + reg[i]);
+						// synchronized: essas linhas formam UM evento de trace, e não podem se
+						// intercalar com um dump/dumpM disparado pelo shell ao mesmo tempo
+						synchronized (System.out) {
+							System.out.print("                                              regs: ");
+							for (int i = 0; i < 10; i++) {
+								System.out.print(" r[" + i + "]:" + reg[i]);
+							}
+							;
+							System.out.println();
+							System.out.print("                      pc: " + pc + "       exec: ");
+							u.dump(ir);
 						}
-						;
-						System.out.println();
-					}
-					if (debug) {
-						System.out.print("                      pc: " + pc + "       exec: ");
-						u.dump(ir);
 					}
 
 				// --------------------------------------------------------------------------------------------------
@@ -226,8 +228,10 @@ public class Sistema {
 								m[endSTD].p = reg[ir.ra];
 								pc++;
                                 if (debug)
-								    {   System.out.print("                                  ");
+								    {   synchronized (System.out) {
+									    System.out.print("                                  ");
 									    u.dump(endSTD,endSTD+1);
+									}
 									}
 								}
 							break;
@@ -528,25 +532,30 @@ public class Sistema {
 			}
 		}
 
-		// dump da memória
+		// dump da memória. synchronized(System.out): cada palavra deve imprimir como um
+		// bloco atômico, sem se intercalar com o trace da CPU rodando em outra thread
 		public void dump(Word w) { // funcoes de DUMP nao existem em hardware - colocadas aqui para facilidade
-			System.out.print("[ ");
-			System.out.print(w.opc);
-			System.out.print(", ");
-			System.out.print(w.ra);
-			System.out.print(", ");
-			System.out.print(w.rb);
-			System.out.print(", ");
-			System.out.print(w.p);
-			System.out.println("  ] ");
+			synchronized (System.out) {
+				System.out.print("[ ");
+				System.out.print(w.opc);
+				System.out.print(", ");
+				System.out.print(w.ra);
+				System.out.print(", ");
+				System.out.print(w.rb);
+				System.out.print(", ");
+				System.out.print(w.p);
+				System.out.println("  ] ");
+			}
 		}
 
 		public void dump(int ini, int fim) {
 			Word[] m = hw.mem.pos; // m[] é o array de posições memória do hw
-			for (int i = ini; i < fim; i++) {
-				System.out.print(i);
-				System.out.print(":  ");
-				dump(m[i]);
+			synchronized (System.out) { // o intervalo inteiro imprime como um bloco só
+				for (int i = ini; i < fim; i++) {
+					System.out.print(i);
+					System.out.print(":  ");
+					dump(m[i]);
+				}
 			}
 		}
 
@@ -556,11 +565,13 @@ public class Sistema {
 		public void dumpLogico(int[] tabelaPaginas, int tamanho) {
 			Word[] m = hw.mem.pos;
 			int tamPg = hw.tamPg;
+			synchronized (System.out) { // o dump inteiro imprime como um bloco só
 			for (int i = 0; i < tamanho; i++) {
 				int frame = tabelaPaginas[i / tamPg];
 				int fisico = frame * tamPg + (i % tamPg);
 				System.out.print(i + " (fisico " + fisico + "):  ");
 				dump(m[fisico]);
+			}
 			}
 		}
 	}
@@ -571,10 +582,12 @@ public class Sistema {
 		private int tamPg;
 		private int numFrames;
 		private boolean[] frameOcupado; // controle de quadros livres/ocupados
+		private Word[] m; // memória física, usado só para limpar frames ao desalocar
 
-		public GerenteMemoria(int tamMem, int tamPg) {
+		public GerenteMemoria(Memory mem, int tamPg) {
 			this.tamPg = tamPg;
-			numFrames = tamMem / tamPg;
+			this.m = mem.pos;
+			numFrames = mem.pos.length / tamPg;
 			frameOcupado = new boolean[numFrames];
 		}
 
@@ -603,10 +616,24 @@ public class Sistema {
 			return tabelaPaginas;
 		}
 
-		// libera os frames usados por um processo
+		// libera os frames usados por um processo, limpando seu conteúdo - sem isso, um
+		// processo futuro que reaproveitasse o frame poderia ler dados deixados por este
+		// (ex.: preenchimento não usado da última página, cujo tamanho não é conferido
+		// byte a byte por traduz - só a página como um todo)
 		public void desaloca(int[] tabelaPaginas) {
 			for (int frame : tabelaPaginas) {
 				frameOcupado[frame] = false;
+				limpaFrame(frame);
+			}
+		}
+
+		private void limpaFrame(int frame) {
+			int inicio = frame * tamPg;
+			for (int i = inicio; i < inicio + tamPg; i++) {
+				m[i].opc = Opcode.___;
+				m[i].ra = -1;
+				m[i].rb = -1;
+				m[i].p = -1;
 			}
 		}
 	}
@@ -690,16 +717,19 @@ public class Sistema {
 			return new ArrayList<>(todosProcessos.values()); // cópia defensiva
 		}
 
-		// tira o próximo processo pronto da fila (ou null se não houver nenhum)
-		public synchronized PCB proximoPronto() {
-			return prontos.poll();
-		}
-
-		// tira o processo da fila de prontos e o marca como rodando
-		public synchronized void iniciaExecucao(PCB pcb) {
-			prontos.remove(pcb);
-			running = pcb;
-			pcb.estado = EstadoProcesso.RODANDO;
+		// tira o próximo processo pronto da fila e já o marca como rodando, atomicamente.
+		// precisa ser UM único método synchronized (não dois): se o "tirar da fila" e o
+		// "marcar como rodando" fossem passos separados, o processo ficaria num estado
+		// intermediário (fora de prontos, mas ainda com estado==PRONTO) onde tentaRemover
+		// não o reconheceria como em execução e poderia desaloca-lo por baixo do escalonador
+		public synchronized PCB escalonaProximo() {
+			PCB proximo = prontos.poll();
+			if (proximo == null) {
+				return null;
+			}
+			running = proximo;
+			proximo.estado = EstadoProcesso.RODANDO;
+			return proximo;
 		}
 
 		// processo perdeu a CPU por fim de fatia de tempo, mas continua vivo: volta pro fim da fila
@@ -738,13 +768,12 @@ public class Sistema {
 		// escolhe o próximo processo pronto (se houver) e prepara a CPU para executá-lo.
 		// só é chamado a partir de uma única thread por vez (a de escalonamento, direta
 		// ou indiretamente via ih.handle/sysCall.stop rodando dentro de hw.cpu.run()),
-		// então a segurança vem inteiramente dos métodos synchronized do GP que ele chama
+		// então a segurança vem inteiramente do método synchronized do GP que ele chama
 		public void escalona() {
-			PCB proximo = gp.proximoPronto();
+			PCB proximo = gp.escalonaProximo(); // atômico: tira de prontos e marca RODANDO numa só chamada
 			if (proximo == null) {
 				return; // fila de prontos vazia - CPU fica ociosa
 			}
-			gp.iniciaExecucao(proximo);
 			hw.cpu.setContext(proximo);
 		}
 	}
@@ -759,7 +788,7 @@ public class Sistema {
 
 		public SO(HW hw) {
 			utils = new Utilities(hw);
-			gm = new GerenteMemoria(hw.mem.pos.length, hw.tamPg);
+			gm = new GerenteMemoria(hw.mem, hw.tamPg);
 			gp = new GerenteProcessos(gm, utils);
 			escalonador = new Escalonador(hw, gp); // gm/gp/escalonador antes de ih/sc, que agora dependem deles
 			ih = new InterruptHandling(hw, gp, escalonador); // rotinas de tratamento de int
@@ -787,17 +816,26 @@ public class Sistema {
 
 		public void run() {
 			while (rodando) {
-				if (so.gp.getRunning() == null) {
-					so.escalonador.escalona(); // tenta achar um processo pronto (bootstrap ou CPU ociosa)
-				}
-				if (so.gp.getRunning() != null) {
-					hw.cpu.run(); // roda uma fatia (ou até terminar/erro); ao voltar, o handler já preparou o próximo
-				} else {
-					try {
-						Thread.sleep(20);
-					} catch (InterruptedException e) {
-						// interrompida por encerra() - volta a checar o flag rodando
+				try {
+					if (so.gp.getRunning() == null) {
+						so.escalonador.escalona(); // tenta achar um processo pronto (bootstrap ou CPU ociosa)
 					}
+					if (so.gp.getRunning() != null) {
+						hw.cpu.run(); // roda uma fatia (ou até terminar/erro); ao voltar, o handler já preparou o próximo
+					} else {
+						try {
+							Thread.sleep(20);
+						} catch (InterruptedException e) {
+							// interrompida por encerra() - volta a checar o flag rodando
+						}
+					}
+				} catch (RuntimeException e) {
+					// nunca deixa uma exceção inesperada matar esta thread silenciosamente - isso
+					// travaria o escalonamento para sempre, com o shell continuando de pé como se
+					// nada tivesse acontecido. Libera o processo que estava rodando (se algum) e
+					// segue em frente; hw.cpu.setContext() reseta o estado da CPU no próximo escalona()
+					System.out.println("ERRO inesperado no escalonador (" + e + ") - processo em execucao finalizado, escalonamento continua");
+					so.gp.finalizaProcessoEmExecucao();
 				}
 			}
 		}
@@ -939,6 +977,11 @@ public class Sistema {
 			try {
 				int ini = Integer.parseInt(partes[1]);
 				int fim = Integer.parseInt(partes[2]);
+				int tamMem = hw.mem.pos.length;
+				if (ini < 0 || fim > tamMem || ini > fim) {
+					System.out.println("intervalo invalido: memoria tem " + tamMem + " posicoes (0.." + (tamMem - 1) + ")");
+					return;
+				}
 				so.utils.dump(ini, fim);
 			} catch (NumberFormatException e) {
 				System.out.println("uso: dumpM <inicio> <fim> (inteiros)");
