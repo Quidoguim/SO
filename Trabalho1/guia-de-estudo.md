@@ -1,142 +1,127 @@
 # Trabalho 1 de SO — Guia de Estudo
 
-18/10/2026 · Guilherme Guimarães Santos
+Guilherme Guimarães Santos
 
-## Visão geral
+Foco: o que cada enunciado pede, o que foi feito e por quê. Cada seção termina com perguntas prováveis do professor.
 
-O Trabalho 1 constrói um sistema operacional simples em cima de uma máquina virtual (MV) simulada em Java. Cada fase acrescenta uma peça do SO sobre a anterior. Todo o código fica em `Sistema.java`, em classes aninhadas.
+## Mapa rápido
 
-| Fase | Enunciado | O que entra | Conceito de SO |
+| Fase | Enunciado | Peça | Classe(s) |
 | --- | --- | --- | --- |
-| HW | 01 | CPU, memória, instruções, interrupções (fornecido pelo professor) | Ciclo de busca e execução |
-| 1A | 02 | Gerente de Memória | Paginação |
-| 1B | 03 | Gerente de Processos + shell | Processo, PCB, fila de prontos |
-| 1C | 04 | Escalonador + thread de escalonamento | Round-robin, troca de contexto, concorrência |
+| HW | 01 | CPU, memória, interrupções (do professor) | `CPU`, `Memory`, `Word` |
+| 1A | 02 | Gerente de Memória (paginação) | `GerenteMemoria`, `CPU.traduz` |
+| 1B | 03 | Gerente de Processos + shell | `GerenteProcessos`, `PCB`, `Shell` |
+| 1C | 04 | Escalonador round-robin + execução contínua | `Escalonador`, `InterruptHandling`, `ThreadEscalonador` |
 
-O enunciado 05 é o esquema de referência: diagramas da arquitetura sequencial, multithread e multithread com E/S. A versão com E/S fica para depois do T1.
+O enunciado 05 só traz diagramas de referência. A versão com E/S (Console, fila de bloqueados) não foi implementada: o enunciado 04 diz que E/S vem "mais adiante".
 
-## Hardware simulado (HW)
+**Configuração:** `new Sistema(1024, 8, 5)` no `main()` = memória, tamanho de página, delta. O enunciado 02 diz que o professor vai testar outros valores: troque ali e recompile. Testado com `512, 16, 3`.
 
-A MV é o "computador" sobre o qual o SO roda. Ela não muda entre as fases, e os programas de teste nunca são alterados.
+---
 
-- **Memória (`Memory`, `Word`):** um array de palavras. Cada palavra tem `opc` (opcode), `ra`, `rb` e `p` (parâmetro). `DATA` marca uma palavra de dado.
-- **CPU:** `pc`, `ir` (instrução atual) e 8 registradores `reg[0..7]`. `reg[8]` e `reg[9]` passam os parâmetros das chamadas de sistema.
-- **Ciclo de instrução (`CPU.run`):** busca a instrução em `pc`, executa e, ao final, verifica se há interrupção.
-- **Interrupções:** `intEnderecoInvalido`, `intInstrucaoInvalida`, `intOverflow` e, a partir do 1C, `intTimer`. Qualquer uma desvia para a rotina de tratamento do SO.
-- **Chamadas de sistema:** `STOP` termina o processo; `SYSCALL` com `reg[8]=2` escreve na tela (`OUT:`). A leitura (`reg[8]=1`) ainda é um stub.
+## HW (enunciado 01)
 
-## Paginação e Gerente de Memória (1A)
+- **Pede:** CPU com `pc`, `ir`, 8 registradores; memória de palavras; ciclo busca → executa → atualiza `pc`.
+- **Fizemos:** igual, sem mudar nada dos programas. O ciclo ganhou uma terceira fase: verificar interrupção ao fim de cada instrução.
+- **Detalhe:** a CPU tem **10** registradores. `reg[8]` e `reg[9]` são os parâmetros da `SYSCALL` (`reg[8]=2` escreve, `reg[9]` = endereço). Já vinha assim no código do professor.
 
-Paginação deixa um processo ocupar pedaços espalhados da memória, sem precisar de um bloco contínuo. O programa continua "achando" que está contínuo a partir do endereço 0.
+**Perguntas prováveis**
+- *O enunciado diz 8 registradores, por que tem 10?* → Os dois extras levam os parâmetros da chamada de sistema.
+- *Quando a CPU olha as interrupções?* → No fim de cada instrução. Por isso um processo nunca é interrompido "no meio" de uma instrução.
 
-**Conceitos**
+---
 
-- A memória física é dividida em **frames** de `tamPg` palavras; o programa, em **páginas** do mesmo tamanho. Com 1024 palavras e páginas de 8, são 128 frames.
-- A **tabela de páginas** do processo diz em que frame está cada página: `tabelaPaginas[pagina] = frame`.
-- O programa usa **endereços lógicos**; a CPU traduz cada acesso para o **endereço físico**:
+## 1A — Paginação (enunciado 02)
 
-```math
-\text{fisico} = \text{tabelaPaginas}[\lfloor e / tamPg \rfloor] \times tamPg + (e \bmod tamPg)
+**Ideia:** a memória é dividida em frames do tamanho de uma página. O processo pensa que está contínuo a partir do 0 (endereço lógico); a tabela de páginas diz em que frame está cada página.
+
+```
+físico = tabelaPaginas[lógico / tamPg] * tamPg + (lógico % tamPg)
 ```
 
-**Exemplo da apresentação:** `fibonacci10` com páginas `[5, 6, 9, 10]`. O endereço lógico 16 cai na página 2, que está no frame 9: 9 × 8 + 0 = 72.
+Exemplo: páginas `[5, 6, 9, 10]`, lógico 16 → página 2 → frame 9 → 9×8 + 0 = 72.
 
-**Como implementamos**
+| Enunciado pede | Fizemos | Por quê |
+| --- | --- | --- |
+| `Boolean aloca(IN nroPalavras, OUT tabelaPaginas)` | `int[] aloca(nroPalavras)`, `null` se não cabe | Java não tem parâmetro de saída. Mesmo efeito. |
+| Alocar código e dados | Aloca `ceil(tamanho / tamPg)` frames, os primeiros livres | Simples; os frames não precisam ser contíguos |
+| `desaloca` libera os frames | Só marca livre, **não apaga** | O enunciado 04 §3.1 pede ver o resultado em memória depois que o processo termina |
+| (não pede) | **Zera** o frame ao entregá-lo | Um processo novo nunca vê lixo de outro (ver proteção abaixo) |
+| Traduzir todo acesso | `CPU.traduz` em toda leitura/escrita, inclusive saltos indiretos e a `SYSCALL` | Se um acesso escapar da tradução, o processo lê/escreve em memória física errada |
 
-- `GerenteMemoria.aloca(nroPalavras)`: devolve a tabela de páginas, ou `null` se não há frames livres suficientes. Limpa cada frame antes de entregá-lo.
-- `desaloca(tabelaPaginas)`: só marca os frames como livres. O conteúdo fica visível no `dumpM` até o frame ser reaproveitado.
-- `Utilities.carregaPaginado`: copia cada página do programa para o seu frame.
-- `CPU.traduz`: faz a tradução em todo acesso à memória. Se a página não existe na tabela, gera `intEnderecoInvalido`. Essa é a **proteção de memória**: um processo não enxerga a memória de outro.
+**Proteção de memória:** `traduz` gera `intEnderecoInvalido` se a página não está na tabela do processo (ou endereço negativo). A checagem é **por página, não por palavra**: um programa de 30 palavras ocupa 4 páginas (32 palavras) e consegue acessar 30 e 31 sem erro. Mas essas palavras são frames dele, zerados na alocação, então nunca têm dado de outro processo.
 
-## Processos, PCB e shell (1B)
+**Perguntas prováveis**
+- *Por que zerar na alocação e não na liberação?* → Zerar na liberação apagaria o resultado do processo que terminou, e o 04 §3.1 pede para vê-lo. Zerar na alocação protege do mesmo jeito.
+- *Por que PB e PC dão `intEnderecoInvalido`?* → Acessam endereços além das páginas alocadas (PB grava em 50 com 2 páginas; PC usa 96–99 com 7 páginas). Os programas não podem ser alterados, então é a proteção funcionando.
+- *Com páginas de 16 e 1024 palavras?* → 64 frames. Um programa de 30 palavras usa 2 páginas.
+- *Páginas `[2, 7]`, página 8, lógico 10?* → página 1 → frame 7 → 7×8 + 2 = 58.
 
-Um **processo** é um programa carregado na memória e pronto para rodar. O SO controla cada processo pelo seu **PCB** (Process Control Block).
+---
 
-**Conceitos**
+## 1B — Processos e shell (enunciado 03)
 
-- **PCB:** a ficha do processo, com `id`, estado, tamanho, tabela de páginas e, a partir do 1C, o contexto salvo (`pc` e registradores).
-- **Fila de prontos:** os PCBs que podem ganhar a CPU.
-- **Running:** ponteiro para o único processo que está na CPU agora.
-- **Estados no nosso SO:** `PRONTO` (na fila) e `RODANDO` (na CPU). Quando termina, o processo some.
+**PCB** guarda: `id`, estado, tamanho, tabela de páginas, `pc` e registradores. Estados: `PRONTO` e `RODANDO` (quando termina, o processo some).
+**GP** guarda: todos os processos, a fila de prontos e o ponteiro `running`.
 
-**Como implementamos (`GerenteProcessos`)**
+| Enunciado pede | Fizemos | Por quê |
+| --- | --- | --- |
+| `boolean criaProcesso(programa)` | Devolve o `id` (ou `-1`) | O `new` precisa mostrar o id. Achar o programa pelo nome fica no Shell, para "programa não existe" e "sem memória" darem mensagens diferentes |
+| `rm <id>`, "tenha ele executado ou não" | Remove, mas **recusa se estiver `RODANDO`** | Liberar os frames de quem está na CPU faria ele escrever em memória que já pode ser de outro processo |
+| `exec <id>` executa o processo | Só **coloca o processo no início da fila** | Desde o 1C a CPU roda sozinha em outra thread; se o Shell também mexesse na CPU, as duas brigariam por ela |
+| Comandos com os nomes dados, "pode criar outros" | Extras: `execAll`, `pause`, `resume`, `delay` | `pause`/`delay` existem para a demonstração: sem eles tudo termina em milissegundos |
 
-- `criaProcesso(imagem)`: pede frames ao GM, carrega o programa, cria o PCB e o coloca na fila de prontos. Devolve o `id`, ou `-1` sem memória.
-- `tentaRemover(id)`: desaloca memória e PCB. Recusa se o processo estiver `RODANDO`.
-- `Shell`: lê um comando por linha (`new`, `rm`, `ps`, `dump`, `dumpM`, `exec`, `execAll`, `traceOn`/`traceOff`, `exit`, e os de demonstração `pause`, `resume`, `delay`). Entrada inválida só imprime uma mensagem de uso.
+**Perguntas prováveis**
+- *O que é o PCB e por que ele existe?* → É a ficha do processo. Com vários processos na memória, o SO precisa saber onde cada um está e onde parou.
+- *Por que o `exec` não executa?* → A execução é contínua (04 §3.2). Quem manda na CPU é só a thread do escalonador; o `exec` só dá prioridade.
 
-O uso de cada comando está no `roteiro-apresentacao.md`.
+---
 
-## Escalonamento round-robin e troca de contexto (1C)
+## 1C — Escalonamento round-robin (enunciado 04)
 
-Cada processo usa a CPU por uma **fatia de tempo** de `delta` instruções. Depois, dá a vez ao próximo da fila. Assim todos avançam em rodízio.
+**Ciclo:** processo roda `delta` instruções → timer → salva contexto → volta ao fim da fila → próximo da fila ganha a CPU. `STOP` ou erro → libera memória e PCB → próximo da fila.
 
-```mermaid
-flowchart LR
-    F["Fila de prontos<br/>PCBs no estado PRONTO"] --> E["Escalonador<br/>restaura o contexto"]
-    E --> C["CPU executa<br/>até delta instruções"]
-    C -- timer --> S["Salva o contexto<br/>pc vai para o PCB"]
-    S -- fim da fila --> F
-    C -- STOP ou erro --> D["Desaloca memória e PCB<br/>processo sai do sistema"]
-```
+| Enunciado pede | Fizemos | Por quê |
+| --- | --- | --- |
+| Relógio: thread que dorme **ou** contador de instruções | Contador (`contadorDelta`); ao chegar em `delta`, liga `intTimer` | O enunciado sugere: mais simples e previsível. Reaproveita o mesmo ponto onde a CPU já tratava interrupções |
+| Salvar contexto no PCB | `setContext` faz `reg = pcb.reg` (mesmo array); na preempção só copia o `pc` | Enquanto o processo roda, os registradores da CPU já **são** os do PCB. Não precisa copiar nada além do `pc` |
+| `STOP`: liberar memória e PCB, escalonar outro (§2.2) | `finalizaProcessoEmExecucao()` + `escalona()` | Literal do enunciado |
+| Erro (overflow, endereço inválido, instrução inválida) | Mesmo caminho do `STOP` | Diagrama do 05: "finalizar processo, chamar escalonador" |
+| `execAll` roda todos até acabar (§3.1) | Retoma o escalonador e espera não sobrar processo | Com execução contínua, quem executa já é a thread; `execAll` só espera |
 
-*A cada `delta` instruções, o processo volta ao fim da fila; `STOP` ou erro o retiram do sistema.*
+**Perguntas prováveis**
+- *O que é o contexto e por que salvar o `pc`?* → `pc` + registradores. Sem o `pc`, o processo voltaria do início em vez de onde parou.
+- *Por que não copiar os registradores?* → Eles já estão no PCB: a CPU usa o próprio array do PCB.
+- *E com `delta` = 1? E 1000?* → 1: troca a cada instrução, muito chaveamento. 1000: quase sem rodízio, um processo pequeno termina antes de perder a CPU.
+- *O que acontece com o processo no fim da fatia? E no `STOP`?* → Fatia: volta para o fim da fila, vivo. `STOP`: sai do sistema.
 
-**Conceitos**
+---
 
-- **Relógio:** o enunciado permite um contador de instruções em vez de um relógio real. A cada `delta` instruções, a CPU liga a interrupção `intTimer`.
-- **Contexto:** o estado da CPU que pertence ao processo (`pc` + registradores). É salvo no PCB na saída e restaurado na volta, para o processo continuar de onde parou.
-- **Fim de processo:** `STOP` é uma chamada de sistema; o SO libera memória e PCB e escalona outro.
+## 1C — Execução contínua e threads (enunciado 04 §3.2)
 
-**Como implementamos**
+**Pede:** escalonar sem depender de comando; no mínimo duas threads (usuário + escalonamento).
 
-- `CPU.setContext(pcb)` faz `reg = pcb.reg`: os registradores da CPU *são* os do PCB enquanto o processo roda. Na preempção, só o `pc` precisa ser copiado (`salvaContexto`).
-- `InterruptHandling`: `intTimer` salva o contexto e devolve o processo ao fim da fila; qualquer outra interrupção finaliza o processo. Os dois casos terminam chamando `escalonador.escalona()`.
-- `execAll`: espera até não sobrar processo (e retoma o escalonador, se estiver pausado).
-
-## Execução contínua com threads (1C, §3.2)
-
-O enunciado pede que o escalonamento não dependa de um comando: basta existir processo para ele rodar. Para isso o SO precisa de no mínimo duas threads.
-
-| Thread | O que faz |
+| Thread | Faz |
 | --- | --- |
-| Shell (principal) | Lê e executa os comandos do usuário |
-| `ThreadEscalonador` | Em laço: se a CPU está livre, escalona; se há processo, roda uma fatia; senão, dorme 20 ms |
+| Shell (principal) | Lê e executa comandos |
+| `ThreadEscalonador` | Laço: se ninguém roda, escalona; se tem processo, roda uma fatia; senão dorme 20 ms |
 
-**Concorrência:** as duas threads mexem nas mesmas filas. Por isso:
+**Diferença do diagrama do 05:** lá são 3 threads (Shell, Escalonador, CPU) acordadas por semáforos. Aqui a `ThreadEscalonador` faz o papel de escalonador e de CPU, e verifica a fila a cada 20 ms (polling). Atende ao "no mínimo duas threads" com menos peças para errar. O custo: até 20 ms de atraso para pegar um processo novo.
 
-- todo método do `GerenteProcessos` é `synchronized`;
-- `escalonaProximo()` tira o processo da fila e o marca `RODANDO` num só passo. Separado, um `rm` no meio do caminho liberaria os frames do processo que ia rodar;
-- o Shell nunca toca na CPU. `exec <id>` só coloca o processo no início da fila;
-- as saídas no console usam `synchronized (System.out)` para o texto das duas threads não se misturar.
+**Cuidados porque duas threads mexem nas mesmas filas**
 
-O enunciado 05 mostra uma versão mais elaborada, com semáforos (`semaSch`, `semaCPU`). Nós usamos um laço simples com espera (polling), que atende ao requisito.
-
-## Decisões de projeto e pontos de atenção
-
-| Decisão | Por quê |
+| Cuidado | Por quê |
 | --- | --- |
-| `aloca` devolve `int[]` ou `null`, em vez de `boolean` + parâmetro de saída | Mais natural em Java; mesmo efeito |
-| Frames limpos na alocação, não na liberação | Um processo novo nunca lê lixo de outro, e o resultado de quem terminou continua visível (§3.1) |
-| `reg` do CPU aponta para o `reg` do PCB | Troca de contexto sem copiar registradores |
-| Processo desalocado assim que termina | O enunciado 04 §2.2 manda liberar memória e PCB no `STOP` |
-| Comandos `pause`, `resume`, `delay` | Sem eles, os programas terminam em milissegundos e não dá para mostrar `ps`/`dump` |
+| Todo método do `GerenteProcessos` é `synchronized` | Shell (`new`, `rm`, `ps`) e escalonador alteram as mesmas filas |
+| `escalonaProximo()` tira da fila **e** marca `RODANDO` num único método | Se fossem dois passos, um `rm` no meio veria o processo ainda `PRONTO` e liberaria os frames que a CPU ia usar |
+| `escalona()` não tem lock próprio | Só a thread do escalonador o chama; a segurança vem do GP |
+| `debug`, `pausado`, `delayMs`, `rodando` são `volatile` | São escritos pelo Shell e lidos pela outra thread; `volatile` garante que a mudança seja vista |
+| Impressões em `synchronized (System.out)` | Sem isso, trace e `dump` se misturam linha a linha |
+| `try/catch` no laço da thread | Uma exceção mataria a thread em silêncio e o escalonamento pararia para sempre |
 
-**Se o professor perguntar**
-
-- **PB e PC dão `intEnderecoInvalido`:** acessam endereços além da própria imagem (50; 96–99). Como a alocação é pelo tamanho do programa e os programas não podem mudar, é a proteção de memória agindo.
-- **`fibonacciREAD` não gera a série:** a syscall de leitura é um stub, como no código original.
-- **`dump` de um processo rodando pode mostrar `pc` e registradores "atrasados":** a leitura não trava o processo. É só uma foto de depuração; os dados não se corrompem.
-
-## Perguntas para revisar
-
-- [ ] Com memória de 1024 e página de 16, quantos frames há? E quantas páginas ocupa um programa de 30 palavras?
-- [ ] Um processo tem páginas `[2, 7]` e página de 8. Qual o endereço físico do lógico 10?
-- [ ] Por que paginação evita a fragmentação externa?
-- [ ] O que fica guardado no PCB, e por que o `pc` precisa ser salvo na preempção?
-- [ ] O que acontece com um processo no fim da fatia de tempo? E no `STOP`?
-- [ ] O que muda no comportamento com `delta` = 1 e com `delta` = 1000?
-- [ ] Por que o SO precisa de duas threads no §3.2, e qual dado elas compartilham?
-- [ ] Que corrida o `escalonaProximo()` atômico evita?
-
-Respostas das duas primeiras: 64 frames e 2 páginas; 7 × 8 + 2 = 58.
+**Perguntas prováveis**
+- *Por que duas threads?* → Exigência do §3.2: o Shell fica bloqueado esperando digitação, então outra thread precisa rodar os processos enquanto isso.
+- *O que elas compartilham?* → As estruturas do GP (todos os processos, fila de prontos, `running`) e a memória.
+- *Por que polling e não semáforo?* → Mais simples e cumpre o requisito; o preço é acordar a cada 20 ms.
+- *O `dump` de um processo rodando é exato?* → Não necessariamente: lê sem travar, pode mostrar `pc`/registradores de um instante intermediário. É só leitura de depuração, nada se corrompe.
+- *`fibonacciREAD` não funciona?* → A leitura da `SYSCALL` (`reg[8]=1`) continua vazia, como no código original.
