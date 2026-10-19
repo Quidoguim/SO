@@ -609,6 +609,7 @@ public class Sistema {
 			for (int f = 0; f < numFrames && pagina < nroPaginas; f++) {
 				if (!frameOcupado[f]) {
 					frameOcupado[f] = true;
+					limpaFrame(f); // limpa na alocação (não na liberação) - ver comentário de desaloca
 					tabelaPaginas[pagina] = f;
 					pagina++;
 				}
@@ -617,14 +618,15 @@ public class Sistema {
 			return tabelaPaginas;
 		}
 
-		// libera os frames usados por um processo, limpando seu conteúdo - sem isso, um
-		// processo futuro que reaproveitasse o frame poderia ler dados deixados por este
-		// (ex.: preenchimento não usado da última página, cujo tamanho não é conferido
+		// libera os frames usados por um processo SEM apagar seu conteúdo - assim o resultado
+		// de um processo que terminou continua visível via dumpM (enunciado 04, §3.1) até o
+		// frame ser reaproveitado. O isolamento entre processos é garantido por aloca, que
+		// limpa cada frame antes de entregá-lo: um processo novo nunca lê dados deixados por
+		// outro (ex.: preenchimento não usado da última página, cujo tamanho não é conferido
 		// byte a byte por traduz - só a página como um todo)
 		public void desaloca(int[] tabelaPaginas) {
 			for (int frame : tabelaPaginas) {
 				frameOcupado[frame] = false;
-				limpaFrame(frame);
 			}
 			framesLivres += tabelaPaginas.length;
 		}
@@ -836,6 +838,11 @@ public class Sistema {
 		private HW hw;
 		private SO so;
 		private volatile boolean rodando = true;
+		// controles de demonstração (comandos pause/resume/delay do shell): pausado suspende o
+		// escalonamento na próxima fronteira de fatia; delayMs é uma espera após cada fatia,
+		// para o escalonamento ficar acompanhável em tempo humano
+		private volatile boolean pausado = false;
+		private volatile int delayMs = 0;
 
 		public ThreadEscalonador(HW hw, SO so) {
 			this.hw = hw;
@@ -846,17 +853,20 @@ public class Sistema {
 		public void run() {
 			while (rodando) {
 				try {
+					if (pausado) {
+						dorme(20);
+						continue;
+					}
 					if (so.gp.getRunning() == null) {
 						so.escalonador.escalona(); // tenta achar um processo pronto (bootstrap ou CPU ociosa)
 					}
 					if (so.gp.getRunning() != null) {
 						hw.cpu.run(); // roda uma fatia (ou até terminar/erro); ao voltar, o handler já preparou o próximo
-					} else {
-						try {
-							Thread.sleep(20);
-						} catch (InterruptedException e) {
-							// interrompida por encerra() - volta a checar o flag rodando
+						if (delayMs > 0) {
+							dorme(delayMs);
 						}
+					} else {
+						dorme(20);
 					}
 				} catch (RuntimeException e) {
 					// nunca deixa uma exceção inesperada matar esta thread silenciosamente - isso
@@ -869,9 +879,25 @@ public class Sistema {
 			}
 		}
 
+		private void dorme(int ms) {
+			try {
+				Thread.sleep(ms);
+			} catch (InterruptedException e) {
+				// interrompida por encerra() - volta a checar o flag rodando
+			}
+		}
+
 		public void encerra() {
 			rodando = false;
 			interrupt();
+		}
+
+		public void setPausado(boolean p) {
+			pausado = p;
+		}
+
+		public void setDelayMs(int ms) {
+			delayMs = ms;
 		}
 	}
 
@@ -893,7 +919,7 @@ public class Sistema {
 
 		public void loop() {
 			Scanner scanner = new Scanner(System.in);
-			System.out.println("Sistema pronto (escalonamento continuo em background). Comandos: new <programa>, rm <id>, ps, dump <id>, dumpM <ini> <fim>, exec <id>, execAll, traceOn, traceOff, exit");
+			System.out.println("Sistema pronto (escalonamento continuo em background). Comandos: new <programa>, rm <id>, ps, dump <id>, dumpM <ini> <fim>, exec <id>, execAll, traceOn, traceOff, pause, resume, delay <ms>, exit");
 			boolean rodando = true;
 			while (rodando) {
 				System.out.print("> ");
@@ -936,6 +962,17 @@ public class Sistema {
 					case "traceOff":
 						hw.cpu.setDebug(false);
 						System.out.println("trace desligado");
+						break;
+					case "pause":
+						threadEscalonador.setPausado(true);
+						System.out.println("escalonamento pausado (vale a partir do fim da fatia atual) - use resume para continuar");
+						break;
+					case "resume":
+						threadEscalonador.setPausado(false);
+						System.out.println("escalonamento retomado");
+						break;
+					case "delay":
+						cmdDelay(partes);
 						break;
 					case "exit":
 						rodando = false;
@@ -1028,8 +1065,11 @@ public class Sistema {
 		}
 
 		// bloqueia até não sobrar nenhum processo no sistema - a execução em si acontece
-		// na thread de escalonamento, execAll so espera o resultado ficar pronto
+		// na thread de escalonamento, execAll so espera o resultado ficar pronto. Se o
+		// escalonamento estiver pausado, retoma antes (é o teste do enunciado 04 §3.1: carregar
+		// vários processos parados e então disparar execAll) - senão esperaria para sempre
 		private void cmdExecAll() {
+			threadEscalonador.setPausado(false);
 			System.out.println("aguardando todos os processos atuais terminarem...");
 			while (so.gp.existemProcessos()) {
 				try {
@@ -1039,6 +1079,21 @@ public class Sistema {
 				}
 			}
 			System.out.println("execAll concluido - nenhum processo restante");
+		}
+
+		// espera (em ms) após cada fatia de tempo - só para demonstração, deixa o round-robin
+		// acompanhável em tempo humano; delay 0 volta à velocidade normal
+		private void cmdDelay(String[] partes) {
+			Integer ms = parseId(partes, 1, "uso: delay <ms>");
+			if (ms == null) {
+				return;
+			}
+			if (ms < 0) {
+				System.out.println("uso: delay <ms> (ms >= 0)");
+				return;
+			}
+			threadEscalonador.setDelayMs(ms);
+			System.out.println("delay entre fatias: " + ms + " ms");
 		}
 
 		private Integer parseId(String[] partes, int indice, String usoMsg) {
